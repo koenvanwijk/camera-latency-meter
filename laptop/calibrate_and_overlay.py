@@ -466,7 +466,7 @@ canvas.create_rectangle(0, STATUS_Y, WIN_W, WIN_H, fill="#0a0a0a", outline="")
 status_item = canvas.create_text(WIN_W//2, STATUS_Y+STATUS_H//2,
     text="", fill="yellow", font=("monospace", 13), anchor="center")
 canvas.create_text(WIN_W-10, STATUS_Y+STATUS_H//2,
-    text="S=opslaan  T=threshold(alle 3)  ↑↓=thr±1  Shift+↑↓=±10  Tab=ROI  ESC",
+    text="S=opslaan  T=threshold  Tab=ROI wisselen  ESC",
     fill="#444", font=("monospace", 11), anchor="e")
 
 cam0_ph=[None]; cam1_ph=[None]; graph_ph=[None]
@@ -511,7 +511,8 @@ def on_click(event):
         sc, px = scale1, x-PANEL_W
     cfg["cx"] = max(0, int((px-sc["ox"])/sc["r"]))
     cfg["cy"] = max(0, int((py-sc["oy"])/sc["r"]))
-    status_msg[0] = f"{cfg['label']} → ({cfg['cx']},{cfg['cy']})"
+    status_msg[0] = f"{cfg['label']} → ({cfg['cx']},{cfg['cy']}) — threshold herberekenen..."
+    run_autothreshold(all_rois=True)
 
 def on_scroll(event):
     delta = 1 if (event.delta > 0 or event.num == 4) else -1
@@ -538,14 +539,6 @@ def on_key(event):
     elif k == "tab":
         cam1_active_roi[0] = "scr" if cam1_active_roi[0]=="led" else "led"
         status_msg[0] = f"Actieve cam1 ROI: {active_cam1_cfg()['label']}"
-    elif k in ("up","down"):
-        step  = 10 if (event.state & 1) else 1
-        delta = step if k=="up" else -step
-        led0["thr"]   = max(0, min(255, led0["thr"]+delta))
-        active_cam1_cfg()["thr"] = max(0, min(255, active_cam1_cfg()["thr"]+delta))
-        status_msg[0] = (f"Threshold {'↑' if delta>0 else '↓'}  "
-                         f"cam0={led0['thr']:.0f}  "
-                         f"{active_cam1_cfg()['label']}={active_cam1_cfg()['thr']:.0f}")
 
 root.bind("<Key>", on_key)
 root.after(50, update)
