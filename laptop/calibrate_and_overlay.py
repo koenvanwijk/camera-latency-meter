@@ -44,11 +44,13 @@ WIN_W, WIN_H  = 1920, 1080
 PANEL_W       = WIN_W // 2
 HEADER_H      = 60
 LABEL_H       = 30
-CAM_H         = 510
+CAM_H         = 460
+SIGNAL_H      = 50   # groen/rood vlak onder cameras, boven grafiek
 GRAPH_H       = 220
 STATUS_H      = 30
 CAM_Y         = HEADER_H + LABEL_H
-GRAPH_Y       = CAM_Y + CAM_H
+SIGNAL_Y      = CAM_Y + CAM_H
+GRAPH_Y       = SIGNAL_Y + SIGNAL_H
 STATUS_Y      = GRAPH_Y + GRAPH_H
 GRAPH_HISTORY = 300
 
@@ -406,9 +408,16 @@ def make_cross_img(color, bg=(0,0,0)):
     draw.rectangle([cx-arm, cy-thick//2, cx+arm, cy+thick//2], fill=color)
     return img
 
-GREEN_IMG = ImageTk.PhotoImage(make_cross_img((0, 220, 60)))
-RED_IMG   = ImageTk.PhotoImage(make_cross_img((220, 30, 30)))
-overlay_item = canvas.create_image(0, 0, anchor="nw", image=RED_IMG, state="hidden")
+GREEN_FULL = ImageTk.PhotoImage(make_cross_img((0, 220, 60)))
+RED_FULL   = ImageTk.PhotoImage(make_cross_img((220, 30, 30)))
+# Fullscreen overlay (SPACE mode)
+overlay_item = canvas.create_image(0, 0, anchor="nw", image=RED_FULL, state="hidden")
+
+# Signal bar (always visible in calibrate mode, under cameras)
+signal_bar = canvas.create_rectangle(0, SIGNAL_Y, WIN_W, SIGNAL_Y+SIGNAL_H,
+                                      fill="#330000", outline="")
+signal_txt = canvas.create_text(WIN_W//2, SIGNAL_Y+SIGNAL_H//2,
+    text="LED OFF", fill="white", font=("monospace", 20, "bold"), anchor="center")
 
 # Header
 canvas.create_rectangle(0, 0, WIN_W, HEADER_H, fill="#0d1b2a", outline="")
@@ -444,14 +453,14 @@ canvas.create_text(WIN_W-10, STATUS_Y+STATUS_H//2,
 overlay_status = canvas.create_text(10, 10, anchor="nw", state="hidden",
     fill="#888", font=("monospace", 14), text="")
 
-cam0_ph=[None]; cam1_ph=[None]
+cam0_ph=[None]; cam1_ph=[None]; graph_ph=[None]
 
 # ── Render loop ───────────────────────────────────────────────────────────────
 def update():
     if mode[0] == "overlay":
         canvas.itemconfig(overlay_item, state="normal",
-                          image=GREEN_IMG if cam0_on[0] else RED_IMG)
-        for it in [cam0_item, cam1_item, graph_item, status_item]:
+                          image=GREEN_FULL if cam0_on[0] else RED_FULL)
+        for it in [cam0_item, cam1_item, graph_item, status_item, signal_bar, signal_txt]:
             canvas.itemconfig(it, state="hidden")
         canvas.itemconfig(overlay_status, state="normal",
             text=f"OVERLAY  fps={cam0_fps[0]:.0f}  led={'ON' if cam0_on[0] else 'OFF'}  [C=calibrate  ESC=quit]")
@@ -459,6 +468,16 @@ def update():
         canvas.itemconfig(overlay_item, state="hidden")
         canvas.itemconfig(overlay_status, state="hidden")
         canvas.itemconfig(status_item, state="normal", text=status_msg[0])
+        canvas.itemconfig(signal_bar, state="normal")
+        canvas.itemconfig(signal_txt, state="normal")
+
+        # Update signal bar colour
+        if cam0_on[0]:
+            canvas.itemconfig(signal_bar, fill="#003300")
+            canvas.itemconfig(signal_txt, text="● LED ON", fill="#00ff55")
+        else:
+            canvas.itemconfig(signal_bar, fill="#330000")
+            canvas.itemconfig(signal_txt, text="○ LED OFF", fill="#ff4444")
 
         with cam0_lock: f0 = cam0_frame[0].copy() if cam0_frame[0] is not None else None
         with cam1_lock: f1 = cam1_frame[0].copy() if cam1_frame[0] is not None else None
@@ -469,7 +488,6 @@ def update():
         p1 = ImageTk.PhotoImage(draw_cam1(f1)); cam1_ph[0]=p1
         canvas.itemconfig(cam1_item, image=p1, state="normal")
 
-        graph_ph = [None]
         gp = ImageTk.PhotoImage(draw_triple_graph(list(hist0), list(hist1_led), list(hist1_scr)))
         graph_ph[0] = gp
         canvas.itemconfig(graph_item, image=gp, state="normal")
