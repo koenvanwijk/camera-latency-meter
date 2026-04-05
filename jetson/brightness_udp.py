@@ -42,7 +42,23 @@ def load_rois():
     return DEFAULT_ROIS
 
 rois = load_rois()
-print(f"ROIs: {rois}", flush=True)
+print(f"ROIs (viewer coords): {rois}", flush=True)
+
+# ── Viewer→frame coördinaten conversie ─────────────────────────────────────
+# calibrate_and_overlay.py toont cam0/cam1 in PANEL_W x CAM_H vensters
+# cam0: 640x480 frame → panel 960x390, cam1: 640x480 frame → panel 960x390
+PANEL_W, CAM_H = 960, 390
+
+def viewer_to_frame(roi, frame_w, frame_h):
+    """Converteer ROI van viewer-pixels naar frame-pixels."""
+    ratio = min(PANEL_W / frame_w, CAM_H / frame_h)
+    ox = (PANEL_W - int(frame_w * ratio)) // 2
+    oy = (CAM_H  - int(frame_h * ratio)) // 2
+    return {
+        "cx": max(0, min(frame_w-1, round((roi["cx"] - ox) / ratio))),
+        "cy": max(0, min(frame_h-1, round((roi["cy"] - oy) / ratio))),
+        "r":  max(1, round(roi["r"] / ratio)),
+    }
 
 # ── UDP socket ──────────────────────────────────────────────────────────────
 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -62,7 +78,7 @@ def roi_mean(gray, cfg):
     roi = gray[max(0, cy-r):cy+r, max(0, cx-r):cx+r]
     return float(roi.mean()) if roi.size > 0 else 0.0
 
-def stream_loop(tcp_host, tcp_port, cam_id, roi_keys):
+def stream_loop(tcp_host, tcp_port, cam_id, roi_keys, frame_w=640, frame_h=480):
     fc = 0
     while True:
         try:
@@ -84,10 +100,12 @@ def stream_loop(tcp_host, tcp_port, cam_id, roi_keys):
                     ts = time.time()
                     arr = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_GRAYSCALE)
                     if arr is None: continue
+                    h, w = arr.shape
                     rois_now = rois  # live reference
                     for roi_id, key in enumerate(roi_keys):
                         if key in rois_now:
-                            b = roi_mean(arr, rois_now[key])
+                            r_frame = viewer_to_frame(rois_now[key], w, h)
+                            b = roi_mean(arr, r_frame)
                             send_brightness(cam_id, roi_id, b, fc, ts)
                     fc += 1
             s.close()
