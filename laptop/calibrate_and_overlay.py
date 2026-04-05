@@ -34,10 +34,43 @@ parser.add_argument("--cam1-port", type=int, default=5002)
 parser.add_argument("--win-x",     type=int, default=0)
 parser.add_argument("--win-y",     type=int, default=0)
 parser.add_argument("--auto",      action="store_true", help="Auto-threshold + measure at startup")
+parser.add_argument("--session",   default="", help="Label voor deze meting (voor vergelijking)")
+parser.add_argument("--debounce",  type=int, default=25, help="Debounce ms (0=uit)")
+parser.add_argument("--ui-hz",     type=int, default=60, help="UI refresh rate Hz")
 args = parser.parse_args()
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "roi_config.json")
 CSV_FILE    = os.path.join(os.path.dirname(__file__), "latency_log.csv")
+
+# ── Feature switches (live toggleable via keys 1-5) ───────────────────────────
+features = {
+    "debounce":  True,   # 1 — debounce flanken (25ms stabiel vereist)
+    "outlier":   True,   # 2 — outlier filter (2.5×σ)
+    "tcp_cam1":  True,   # 3 — cam1 via TCP (False = MJPEG HTTP fallback)
+    "ui_60hz":   True,   # 4 — UI 60Hz (False = 20Hz)
+    "csv":       True,   # 5 — CSV schrijven aan/uit
+}
+
+FEATURE_KEYS = {
+    "1": "debounce",
+    "2": "outlier",
+    "3": "tcp_cam1",
+    "4": "ui_60hz",
+    "5": "csv",
+}
+
+def features_tag():
+    """Genereer session tag op basis van actieve features."""
+    parts = []
+    if features["debounce"]:  parts.append("deb")
+    if features["outlier"]:   parts.append("filt")
+    if features["tcp_cam1"]:  parts.append("tcp1")
+    if features["ui_60hz"]:   parts.append("60hz")
+    return "-".join(parts) if parts else "bare"
+
+SESSION_TAG  = [args.session or features_tag()]
+DEBOUNCE_MS  = args.debounce   # initial value; overridden live
+UI_INTERVAL  = [max(8, 1000 // args.ui_hz)]
 
 WIN_W, WIN_H  = 1920, 1080
 PANEL_W       = WIN_W // 2
@@ -103,7 +136,7 @@ hist1_led = collections.deque(maxlen=GRAPH_HISTORY)
 hist1_scr = collections.deque(maxlen=GRAPH_HISTORY)
 
 # ── Latency tracking ──────────────────────────────────────────────────────────
-DEBOUNCE_MS   = 25    # ms signal must be stable before edge is accepted
+DEBOUNCE_MS   = DEBOUNCE_MS   # initial; live reads features["debounce"]
 OUTLIER_SIGMA = 2.5   # samples beyond N×stddev are ignored
 
 lat_led1_rise  = [None]
@@ -126,10 +159,10 @@ lat_display = {
 }
 
 def _append_sample(samples, dt):
-    """Add dt, filter outliers, return filtered list."""
+    """Add dt, filter outliers if enabled, return filtered list."""
     samples.append(dt)
     s = list(samples)
-    if len(s) >= 4:
+    if features["outlier"] and len(s) >= 4:
         m = statistics.mean(s)
         sd = statistics.stdev(s)
         s_filt = [v for v in s if abs(v-m) <= OUTLIER_SIGMA*sd]
@@ -141,18 +174,22 @@ def _write_csv(edge, dt):
     with open(CSV_FILE, "a", newline="") as f:
         w = csv.writer(f)
         if new:
-            w.writerow(["timestamp", "edge", "latency_ms",
-                        "cam0_fps", "cam1_fps"])
-        w.writerow([datetime.datetime.now().isoformat(), edge,
-                    f"{dt:.2f}", f"{cam0_fps[0]:.1f}", f"{cam1_fps[0]:.1f}"])
+            w.writerow(["timestamp", "session", "edge", "latency_ms",
+                        "cam0_fps", "cam1_fps", "debounce_ms", "ui_hz"])
+        if features["csv"]:
+            w.writerow([datetime.datetime.now().isoformat(), SESSION_TAG[0], edge,
+                        f"{dt:.2f}", f"{cam0_fps[0]:.1f}", f"{cam1_fps[0]:.1f}",
+                        25 if features["debounce"] else 0,
+                        60 if features["ui_60hz"] else 20])
 
 def debounce(deb, new_state, t):
     """Returns confirmed new state after DEBOUNCE_MS stable, else None."""
+    deb_ms = 25 if features["debounce"] else 0
     if deb[0] != new_state:
         deb[0] = new_state
         deb[1] = t
         return None
-    if (t - deb[1]) * 1000 >= DEBOUNCE_MS:
+    if (t - deb[1]) * 1000 >= deb_ms:
         return new_state
     return None
 
@@ -263,13 +300,23 @@ def cam1_loop():
     fc = 0; t0 = time.time()
     while True:
         try:
-            sock = socket.socket()
-            sock.connect((args.jetson, args.cam1_port))
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-            sock.settimeout(3)
-            buf = b""
+            if features["tcp_cam1"]:
+                sock = socket.socket()
+                sock.connect((args.jetson, args.cam1_port))
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                sock.settimeout(3)
+                buf = b""
+                def _read():
+                    return sock.recv(65536)
+                def _close(): sock.close()
+            else:
+                req = urllib.request.urlopen(f"http://{args.jetson}:8091/stream", timeout=10)
+                buf = b""
+                def _read(): return req.read(32768)
+                def _close(): req.close()
+
             while True:
-                chunk = sock.recv(65536)
+                chunk = _read()
                 if not chunk: break
                 buf += chunk
                 while True:
@@ -300,7 +347,7 @@ def cam1_loop():
                     if fc % 30 == 0:
                         cam1_fps[0] = 30 / max(0.01, time.time()-t0)
                         t0 = time.time(); fc = 0
-            sock.close()
+            _close()
         except: time.sleep(0.3)
 
 threading.Thread(target=cam0_loop, daemon=True).start()
@@ -578,7 +625,8 @@ def draw_explain():
     draw.text((8, 46), f"Σ geschat ≈ {est_total:.0f}ms  |  cam0:{cam0_fps[0]:.0f}fps  cam1:{cam1_fps[0]:.0f}fps",
               fill=(160,160,80))
     csv_n = len(lat_samples) + len(lat_samples_f)
-    draw.text((8, 60), f"CSV: {CSV_FILE}  ({csv_n} regels)", fill=(60,60,80))
+    feat_str = "  ".join(f"[{'ON' if v else '--'}] {k}" for k,v in features.items())
+    draw.text((8, 60), f"sessie: {SESSION_TAG[0]}   {feat_str}", fill=(80,80,120))
 
     # ── Middle: live measurements
     MX = WIN_W//2 - 60
@@ -656,7 +704,8 @@ canvas.create_rectangle(0, STATUS_Y, WIN_W, WIN_H, fill="#0a0a0a", outline="")
 status_item = canvas.create_text(WIN_W//2, STATUS_Y+STATUS_H//2,
     text="", fill="yellow", font=("monospace", 13), anchor="center")
 canvas.create_text(WIN_W-10, STATUS_Y+STATUS_H//2,
-    text="S=opslaan  P=screenshot  T=threshold  Tab=ROI  ESC",
+    text="S=opslaan  P=screenshot  T=threshold  Tab=ROI  "
+         "1=debounce  2=outlier  3=tcp_cam1  4=ui_60hz  5=csv  ESC",
     fill="#444", font=("monospace", 11), anchor="e")
 
 cam0_ph=[None]; cam1_ph=[None]; graph_ph=[None]; explain_ph=[None]
@@ -691,7 +740,7 @@ def update():
     explain_ph[0] = ep
     canvas.itemconfig(explain_item, image=ep, state="normal")
 
-    root.after(16, update)
+    root.after(UI_INTERVAL[0], update)
 
 # ── Mouse ─────────────────────────────────────────────────────────────────────
 def on_click(event):
@@ -730,6 +779,13 @@ def on_key(event):
     if   k == "escape": root.destroy()
     elif k == "s":      save_config()
     elif k == "p":      threading.Thread(target=save_screenshot, daemon=True).start()
+    elif k in FEATURE_KEYS:
+        fname = FEATURE_KEYS[k]
+        features[fname] = not features[fname]
+        SESSION_TAG[0] = features_tag()
+        UI_INTERVAL[0] = 16 if features["ui_60hz"] else 50
+        status_msg[0] = (f"[{k}] {fname} = {'ON' if features[fname] else 'OFF'}"
+                         f"  →  sessie: {SESSION_TAG[0]}")
     elif k == "t":      run_autothreshold(all_rois=True)
     elif k == "tab":
         cam1_active_roi[0] = "scr" if cam1_active_roi[0]=="led" else "led"
