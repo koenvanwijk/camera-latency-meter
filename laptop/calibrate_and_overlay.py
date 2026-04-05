@@ -473,11 +473,11 @@ def update():
 
         # Update signal bar colour
         if cam0_on[0]:
-            canvas.itemconfig(signal_bar, fill="#003300")
-            canvas.itemconfig(signal_txt, text="● LED ON", fill="#00ff55")
+            canvas.itemconfig(signal_bar, fill="#ffffff")
+            canvas.itemconfig(signal_txt, text="● LED ON", fill="#000000")
         else:
-            canvas.itemconfig(signal_bar, fill="#330000")
-            canvas.itemconfig(signal_txt, text="○ LED OFF", fill="#ff4444")
+            canvas.itemconfig(signal_bar, fill="#000000")
+            canvas.itemconfig(signal_txt, text="○ LED OFF", fill="#ffffff")
 
         with cam0_lock: f0 = cam0_frame[0].copy() if cam0_frame[0] is not None else None
         with cam1_lock: f1 = cam1_frame[0].copy() if cam1_frame[0] is not None else None
