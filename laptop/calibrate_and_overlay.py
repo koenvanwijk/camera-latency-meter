@@ -403,9 +403,18 @@ root.configure(bg="#111")
 canvas = tk.Canvas(root, bg="#111", highlightthickness=0, cursor="crosshair")
 canvas.pack(fill="both", expand=True)
 
-WHITE_IMG = ImageTk.PhotoImage(Image.new("RGB", (WIN_W, WIN_H), (255,255,255)))
-BLACK_IMG = ImageTk.PhotoImage(Image.new("RGB", (WIN_W, WIN_H), (0,0,0)))
-overlay_item = canvas.create_image(0, 0, anchor="nw", image=BLACK_IMG, state="hidden")
+def make_cross_img(color, bg=(0,0,0)):
+    img = Image.new("RGB", (WIN_W, WIN_H), bg)
+    draw = ImageDraw.Draw(img)
+    cx, cy = WIN_W//2, WIN_H//2
+    arm = 350; thick = 80
+    draw.rectangle([cx-thick//2, cy-arm, cx+thick//2, cy+arm], fill=color)
+    draw.rectangle([cx-arm, cy-thick//2, cx+arm, cy+thick//2], fill=color)
+    return img
+
+GREEN_IMG = ImageTk.PhotoImage(make_cross_img((0, 220, 60)))
+RED_IMG   = ImageTk.PhotoImage(make_cross_img((220, 30, 30)))
+overlay_item = canvas.create_image(0, 0, anchor="nw", image=RED_IMG, state="hidden")
 
 # Header
 canvas.create_rectangle(0, 0, WIN_W, HEADER_H, fill="#0d1b2a", outline="")
@@ -448,7 +457,7 @@ cam0_ph=[None]; cam1_ph=[None]; g0_ph=[None]; g1_ph=[None]
 def update():
     if mode[0] == "overlay":
         canvas.itemconfig(overlay_item, state="normal",
-                          image=WHITE_IMG if cam0_on[0] else BLACK_IMG)
+                          image=GREEN_IMG if cam0_on[0] else RED_IMG)
         for it in [cam0_item, cam1_item, graph0_item, graph1_item, status_item]:
             canvas.itemconfig(it, state="hidden")
         canvas.itemconfig(overlay_status, state="normal",
