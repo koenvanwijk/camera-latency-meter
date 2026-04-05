@@ -49,6 +49,7 @@ features = {
     "tcp_cam1":  True,   # 3 — cam1 via TCP (False = MJPEG HTTP fallback)
     "ui_60hz":   True,   # 4 — UI 60Hz (False = 20Hz)
     "csv":       True,   # 5 — CSV schrijven aan/uit
+    "udp_mode":  False,  # 6 — UDP brightness mode (Jetson berekent ROIs zelf)
 }
 
 FEATURE_KEYS = {
@@ -57,6 +58,7 @@ FEATURE_KEYS = {
     "3": "tcp_cam1",
     "4": "ui_60hz",
     "5": "csv",
+    "6": "udp_mode",
 }
 
 def features_tag():
@@ -374,6 +376,56 @@ def cam1_loop():
 
 threading.Thread(target=cam0_loop, daemon=True).start()
 threading.Thread(target=cam1_loop, daemon=True).start()
+
+# ── UDP brightness receiver (#A) ───────────────────────────────────────────
+UDP_PORT = 5010
+UDP_PKT_FMT = "!diiif4i"  # ts, cam_id, roi_id, frame_id, brightness, 4×reserved
+
+def udp_brightness_loop():
+    """Ontvang brightness waarden van Jetson, update ROI state direct."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind(("0.0.0.0", UDP_PORT))
+    s.settimeout(1.0)
+    print(f"UDP brightness listener op poort {UDP_PORT}", flush=True)
+    while True:
+        if not features["udp_mode"]:
+            time.sleep(0.1); continue
+        try:
+            data, _ = s.recvfrom(256)
+            if len(data) < struct.calcsize(UDP_PKT_FMT): continue
+            ts, cam_id, roi_id, frame_id, brightness = struct.unpack(UDP_PKT_FMT, data)[:5]
+            now = time.time()
+
+            # cam0 roi_id=0 → led0
+            if cam_id == 0 and roi_id == 0:
+                cam0_led_bright[0] = brightness
+                vl = brightness
+                new_led0 = vl > led0["thr"]
+                cam0_led_on[0] = new_led0
+                hist0.append((now, vl))
+
+            # cam1 roi_id=0 → led1, roi_id=1 → scr1
+            elif cam_id == 1:
+                if roi_id == 0:
+                    cam1_led_bright[0] = brightness
+                    vl = brightness
+                    new_led = vl > led1["thr"]
+                    conf_led, _ = update_latency(new_led, cam1_scr_on[0], now)
+                    cam1_led_on[0] = conf_led if conf_led is not None else cam1_led_on[0]
+                    hist1_led.append((now, vl))
+                elif roi_id == 1:
+                    cam1_scr_bright[0] = brightness
+                    vs = brightness
+                    new_scr = vs > scr1["thr"]
+                    _, conf_scr = update_latency(cam1_led_on[0], new_scr, now)
+                    cam1_scr_on[0] = conf_scr if conf_scr is not None else cam1_scr_on[0]
+                    hist1_scr.append((now, vs))
+        except socket.timeout: continue
+        except Exception as ex:
+            print(f"UDP err: {ex}", flush=True)
+
+threading.Thread(target=udp_brightness_loop, daemon=True).start()
 
 # ── Auto-threshold ────────────────────────────────────────────────────────────
 def run_autothreshold(all_rois=False, on_done=None):
