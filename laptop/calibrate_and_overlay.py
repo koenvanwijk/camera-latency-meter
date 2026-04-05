@@ -20,7 +20,7 @@ Keys:
   ESC         → afsluiten
 """
 
-import argparse, socket, time, threading, collections, statistics
+import argparse, socket, time, threading, collections, statistics, json, os
 import urllib.request
 import numpy as np
 import tkinter as tk
@@ -33,7 +33,10 @@ parser.add_argument("--cam0-port", type=int, default=5001)
 parser.add_argument("--cam1-url",  default="http://192.168.86.47:8091/stream")
 parser.add_argument("--win-x",     type=int, default=0)
 parser.add_argument("--win-y",     type=int, default=0)
+parser.add_argument("--auto",      action="store_true", help="Auto-threshold + measure at startup")
 args = parser.parse_args()
+
+CONFIG_FILE = os.path.join(os.path.dirname(__file__), "roi_config.json")
 
 WIN_W, WIN_H  = 1920, 1080
 PANEL_W       = WIN_W // 2
@@ -53,6 +56,34 @@ GRAPH_HISTORY = 300
 led0 = {"cx": 460, "cy": 164, "r": 12, "thr": 35.0, "label": "LED0", "col": (0, 230, 80)}
 led1 = {"cx": 869, "cy": 349, "r": 12, "thr": 30.0, "label": "LED1", "col": (180, 100, 255)}
 scr1 = {"cx": 400, "cy": 200, "r": 20, "thr": 128.0,"label": "SCR1", "col": (255, 160, 40)}
+
+def save_config():
+    """Save ROI positions + radii (NOT thresholds — those are lighting-dependent)."""
+    cfg = {
+        "led0": {"cx": led0["cx"], "cy": led0["cy"], "r": led0["r"]},
+        "led1": {"cx": led1["cx"], "cy": led1["cy"], "r": led1["r"]},
+        "scr1": {"cx": scr1["cx"], "cy": scr1["cy"], "r": scr1["r"]},
+    }
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, indent=2)
+    status_msg[0] = f"Config opgeslagen → {CONFIG_FILE}"
+
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        for roi, src in [(led0,"led0"),(led1,"led1"),(scr1,"scr1")]:
+            if src in cfg:
+                roi["cx"] = cfg[src]["cx"]
+                roi["cy"] = cfg[src]["cy"]
+                roi["r"]  = cfg[src]["r"]
+        print(f"Config geladen: {CONFIG_FILE}")
+    except Exception as e:
+        print(f"Config load error: {e}")
+
+load_config()
 
 cam1_active_roi = ["led"]
 mode = ["calibrate"]
@@ -198,21 +229,51 @@ threading.Thread(target=cam0_loop, daemon=True).start()
 threading.Thread(target=cam1_loop, daemon=True).start()
 
 # ── Auto-threshold ────────────────────────────────────────────────────────────
-def run_autothreshold():
-    active = led1 if cam1_active_roi[0] == "led" else scr1
+def run_autothreshold(all_rois=False, on_done=None):
+    """Measure 3s and set thresholds. all_rois=True does all three at once."""
     def _run():
-        status_msg[0] = f"Auto-threshold {active['label']}: collecting 3s..."
-        v0, va = [], []
+        targets = [(led0, lambda: cam0_bright[0]),
+                   (led1, lambda: cam1_led_bright[0]),
+                   (scr1, lambda: cam1_scr_bright[0])] if all_rois else \
+                  [(led0, lambda: cam0_bright[0]),
+                   (active_cam1_cfg(), lambda: cam1_led_bright[0] if cam1_active_roi[0]=="led" else cam1_scr_bright[0])]
+        status_msg[0] = "Auto-threshold: collecting 3s..."
+        samples = {id(cfg): [] for cfg, _ in targets}
         t = time.time()
         while time.time()-t < 3.5:
-            v0.append(cam0_bright[0])
-            va.append(cam1_led_bright[0] if cam1_active_roi[0]=="led" else cam1_scr_bright[0])
+            for cfg, getter in targets:
+                samples[id(cfg)].append(getter())
             time.sleep(0.02)
-        for vals, cfg in [(v0, led0), (va, active)]:
+        parts = []
+        for cfg, _ in targets:
+            vals = samples[id(cfg)]
             mn, mx = min(vals), max(vals)
-            if mx-mn > 4: cfg["thr"] = (mn+mx)/2
-        status_msg[0] = (f"Threshold ✓  cam0={led0['thr']:.0f}  "
-                         f"{active['label']}={active['thr']:.0f}")
+            if mx-mn > 4:
+                cfg["thr"] = (mn+mx)/2
+            parts.append(f"{cfg['label']}={cfg['thr']:.0f}")
+        status_msg[0] = "Threshold ✓  " + "  ".join(parts)
+        if on_done: on_done()
+    threading.Thread(target=_run, daemon=True).start()
+
+def auto_start_sequence():
+    """Wait for streams, auto-threshold all ROIs, then start measuring."""
+    def _run():
+        status_msg[0] = "Auto-start: wachten op streams..."
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if cam0_frame[0] is not None and cam1_frame[0] is not None:
+                break
+            time.sleep(0.2)
+        if cam0_frame[0] is None or cam1_frame[0] is None:
+            status_msg[0] = "Auto-start: streams niet bereikbaar — handmatig calibreren"
+            return
+        status_msg[0] = "Auto-start: streams OK, threshold kalibreren..."
+        time.sleep(0.5)
+        done = threading.Event()
+        run_autothreshold(all_rois=True, on_done=done.set)
+        done.wait(timeout=8)
+        status_msg[0] = "Auto-start klaar — meting loopt. Thresholds: " + \
+                        f"LED0={led0['thr']:.0f} LED1={led1['thr']:.0f} SCR1={scr1['thr']:.0f}"
     threading.Thread(target=_run, daemon=True).start()
 
 # ── Draw camera panels ─────────────────────────────────────────────────────────
@@ -419,7 +480,7 @@ canvas.create_rectangle(0, STATUS_Y, WIN_W, WIN_H, fill="#0a0a0a", outline="")
 status_item = canvas.create_text(WIN_W//2, STATUS_Y+STATUS_H//2,
     text="", fill="yellow", font=("monospace", 13), anchor="center")
 canvas.create_text(WIN_W-10, STATUS_Y+STATUS_H//2,
-    text="T=auto-thr  ↑↓=thr±1  Shift+↑↓=±10  Tab=wissel ROI  SPACE=overlay  C=calib  ESC",
+    text="S=opslaan  T=thr(actief)  A=thr(alles)  ↑↓=thr±1  Shift+↑↓=±10  Tab=ROI  SPACE=overlay  C=calib  ESC",
     fill="#444", font=("monospace", 11), anchor="e")
 
 overlay_status = canvas.create_text(10, 10, anchor="nw", state="hidden",
@@ -503,7 +564,9 @@ def on_key(event):
     if   k == "escape": root.destroy()
     elif k == "space":  mode[0] = "overlay"
     elif k == "c":      mode[0] = "calibrate"
-    elif k == "t":      run_autothreshold()
+    elif k == "s":      save_config()
+    elif k == "t":      run_autothreshold(all_rois=False)
+    elif k == "a":      run_autothreshold(all_rois=True)
     elif k == "tab":
         cam1_active_roi[0] = "scr" if cam1_active_roi[0]=="led" else "led"
         status_msg[0] = f"Actieve cam1 ROI: {active_cam1_cfg()['label']}"
@@ -519,6 +582,12 @@ def on_key(event):
 root.bind("<Key>", on_key)
 root.after(50, update)
 
+if args.auto:
+    root.after(500, auto_start_sequence)
+elif os.path.exists(CONFIG_FILE):
+    # Config gevonden: posities laden, thresholds nog kalibreren
+    root.after(500, lambda: run_autothreshold(all_rois=True))
+
 print(f"Camera Latency Meter | cam0 TCP {args.jetson}:{args.cam0_port} | cam1 {args.cam1_url}")
-print("Tab=wissel ROI  SPACE=overlay  T=threshold  ESC=quit")
+print("S=opslaan  A=thr(alles)  T=thr(actief)  Tab=ROI  SPACE=overlay  C=calib  ESC=quit")
 root.mainloop()
