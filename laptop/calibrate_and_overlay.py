@@ -72,6 +72,24 @@ SESSION_TAG  = [args.session or features_tag()]
 DEBOUNCE_MS  = args.debounce   # initial value; overridden live
 UI_INTERVAL  = [max(8, 1000 // args.ui_hz)]
 
+# ── Control pipe (/tmp/calibrate_ctrl) ───────────────────────────────────────
+CTRL_PIPE = "/tmp/calibrate_ctrl"
+def _ctrl_listener():
+    import os, stat
+    if os.path.exists(CTRL_PIPE): os.remove(CTRL_PIPE)
+    os.mkfifo(CTRL_PIPE)
+    while True:
+        with open(CTRL_PIPE) as f:
+            for line in f:
+                for ch in line.strip():
+                    if ch in FEATURE_KEYS:
+                        fname = FEATURE_KEYS[ch]
+                        features[fname] = not features[fname]
+                        SESSION_TAG[0] = features_tag()
+                        UI_INTERVAL[0] = 16 if features["ui_60hz"] else 50
+                        print(f"[ctrl] {fname}={'ON' if features[fname] else 'OFF'} → {SESSION_TAG[0]}", flush=True)
+threading.Thread(target=_ctrl_listener, daemon=True).start()
+
 WIN_W, WIN_H  = 1920, 1080
 PANEL_W       = WIN_W // 2
 HEADER_H      = 60
@@ -224,6 +242,10 @@ def update_latency(raw_led_on, raw_scr_on, t):
                 lat_display["max"]    = max(s)
                 lat_display["stddev"] = statistics.stdev(s) if len(s)>1 else 0
                 lat_display["n"]      = len(s)
+                # Auto-recalibreer elke 10 metingen
+                if len(s) % 10 == 0:
+                    threading.Thread(target=run_autothreshold,
+                                     kwargs={"all_rois": True}, daemon=True).start()
 
     # Falling edge: LED1 OFF → SCR1 OFF
     if led_fall:
