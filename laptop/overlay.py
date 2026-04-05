@@ -101,7 +101,13 @@ def gemini_find_led(img_bgr):
     if text.lower().startswith("json"):
         text = text[4:].strip()
     r = json.loads(text)
-    cx, cy = int(r["cx"]), int(r["cy"])
+    raw_cx, raw_cy = int(r["cx"]), int(r["cy"])
+    # Gemini normalizes coordinates to 0-1000 — scale to actual pixels
+    if raw_cx <= 1000 and raw_cy <= 1000 and (raw_cx > w or raw_cy > h):
+        cx = int(raw_cx / 1000 * w)
+        cy = int(raw_cy / 1000 * h)
+    else:
+        cx, cy = raw_cx, raw_cy
     # Validate within frame
     if 0 <= cx < w and 0 <= cy < h:
         return cx, cy

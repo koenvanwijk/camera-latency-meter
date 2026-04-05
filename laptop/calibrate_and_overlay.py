@@ -132,7 +132,13 @@ def run_gemini():
             text = text.strip("`").strip()
             if text.lower().startswith("json"): text = text[4:].strip()
             r = json.loads(text)
-            cx, cy = int(r["cx"]), int(r["cy"])
+            raw_cx, raw_cy = int(r["cx"]), int(r["cy"])
+            # Gemini normalizes to 0-1000 range — scale back to pixel coords
+            if raw_cx <= 1000 and raw_cy <= 1000 and (raw_cx > w or raw_cy > h):
+                cx = int(raw_cx / 1000 * w)
+                cy = int(raw_cy / 1000 * h)
+            else:
+                cx, cy = raw_cx, raw_cy
             if 0 <= cx < w and 0 <= cy < h:
                 led["cx"], led["cy"] = cx, cy
                 gemini_status[0] = f"Gemini: LED @ ({cx},{cy}) ✓"
