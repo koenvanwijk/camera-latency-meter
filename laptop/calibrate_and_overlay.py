@@ -45,7 +45,7 @@ PANEL_W       = WIN_W // 2
 HEADER_H      = 60
 LABEL_H       = 30
 CAM_H         = 510
-GRAPH_H       = 150
+GRAPH_H       = 220
 STATUS_H      = 30
 CAM_Y         = HEADER_H + LABEL_H
 GRAPH_Y       = CAM_Y + CAM_H
@@ -284,113 +284,107 @@ def _draw_roi(draw, cfg, bright, on, ratio, ox, oy, alpha=1.0, active=True):
     draw.text((cx_d+r_d+5, cy_d-4),  f"{bright:.1f} {state}", fill=label_col)
 
 # ── Draw brightness graph ──────────────────────────────────────────────────────
-def draw_graph0(history, on):
-    return _draw_graph_single(history, led0, on)
-
-def draw_graph1(h_led, h_scr):
-    """cam1 graph shows both LED1 and SCR1 signals."""
-    img = Image.new("RGB", (PANEL_W, GRAPH_H), (15, 15, 20))
+def draw_triple_graph(h0, h_led, h_scr):
+    """Full-width 3-track timeline. Shared time axis. W x GRAPH_H."""
+    W = WIN_W
+    img = Image.new("RGB", (W, GRAPH_H), (12, 12, 18))
     draw = ImageDraw.Draw(img)
-    PAD_L, PAD_R, PAD_T, PAD_B = 50, 10, 10, 25
-    gw = PANEL_W - PAD_L - PAD_R
-    gh = GRAPH_H - PAD_T - PAD_B
 
-    # Grid
-    for i in range(5):
-        y = PAD_T + int(i * gh / 4)
-        draw.line([(PAD_L, y), (PANEL_W-PAD_R, y)], fill=(40,40,50), width=1)
+    PAD_L, PAD_R, PAD_T, PAD_B = 64, 12, 6, 20
+    gw  = W - PAD_L - PAD_R
+    gh  = GRAPH_H - PAD_T - PAD_B
+    TH  = gh // 3          # height per track
+    TRACKS = [
+        (h0,     led0, cam0_bright[0],     cam0_on[0],     "CAM0 LED0",  (0,220,80)),
+        (h_led,  led1, cam1_led_bright[0], cam1_led_on[0], "CAM1 LED1",  (170,90,255)),
+        (h_scr,  scr1, cam1_scr_bright[0], cam1_scr_on[0], "CAM1 SCR1",  (255,155,30)),
+    ]
 
-    pts_led = list(h_led)
-    pts_scr = list(h_scr)
-    if not pts_led and not pts_scr:
-        draw.text((PAD_L+5, PAD_T+5), "Collecting data...", fill=(80,80,80))
+    # Shared time window
+    all_pts = list(h0) + list(h_led) + list(h_scr)
+    if not all_pts:
+        draw.text((PAD_L+10, PAD_T+10), "Collecting data...", fill=(80,80,80))
         return img
+    t_end  = max(t for t,_ in all_pts)
+    t_span = max(5.0, t_end - min(t for t,_ in all_pts))
 
-    all_vals = [v for _,v in pts_led] + [v for _,v in pts_scr] + [led1["thr"], scr1["thr"]]
-    vmin = max(0,   min(all_vals) - 10)
-    vmax = min(255, max(all_vals) + 10)
-    vrange = max(vmax - vmin, 10)
-
-    t_end  = max((pts_led[-1][0] if pts_led else 0), (pts_scr[-1][0] if pts_scr else 0))
-    t_span = max(5.0, t_end - min(
-        (pts_led[0][0] if pts_led else t_end),
-        (pts_scr[0][0] if pts_scr else t_end)))
-
-    def yx(v): return PAD_T + int((1-(v-vmin)/vrange)*gh)
     def xx(t): return PAD_L + int(((t-(t_end-t_span))/t_span)*gw)
 
-    # Threshold lines
-    for cfg, label_off in [(led1, 0), (scr1, 12)]:
-        ty = yx(cfg["thr"])
-        draw.line([(PAD_L, ty), (PANEL_W-PAD_R, ty)],
-                  fill=tuple(int(c*0.7) for c in cfg["col"]), width=1)
-        draw.text((PAD_L-44, ty-8+label_off),
-                  f"{cfg['label']}={cfg['thr']:.0f}",
-                  fill=tuple(int(c*0.7) for c in cfg["col"]))
+    # Vertical grid lines (time)
+    for i in range(6):
+        x = PAD_L + int(i * gw / 5)
+        draw.line([(x, PAD_T), (x, PAD_T+gh)], fill=(35,35,45), width=1)
+        t_label = t_span * (1 - i/5)
+        draw.text((x-12, PAD_T+gh+3), f"-{t_label:.1f}s", fill=(50,50,55))
 
-    # Signal lines
-    for pts, cfg, bright_now, on_now in [
-        (pts_led, led1, cam1_led_bright[0], cam1_led_on[0]),
-        (pts_scr, scr1, cam1_scr_bright[0], cam1_scr_on[0]),
-    ]:
-        if len(pts) < 2: continue
-        vals = [v for _,v in pts]
-        line_pts = [(xx(t), yx(v)) for t,v in pts if PAD_L <= xx(t) <= PANEL_W-PAD_R]
+    # Draw each track
+    for ti, (hist, cfg, bright_now, on_now, label, col) in enumerate(TRACKS):
+        track_top = PAD_T + ti * TH
+        track_bot = track_top + TH - 2
+        tmid = (track_top + track_bot) // 2
+
+        # Track bg + separator
+        draw.rectangle([PAD_L, track_top, W-PAD_R, track_bot], fill=(18,18,25))
+        draw.line([(0, track_top), (W, track_top)], fill=(40,40,50), width=1)
+
+        # Label left
+        col_dim = tuple(int(c*0.7) for c in col)
+        draw.text((2, tmid-8), label, fill=col_dim)
+
+        pts = list(hist)
+        if len(pts) < 2:
+            draw.text((PAD_L+10, tmid-6), "collecting...", fill=(60,60,60))
+            continue
+
+        vals   = [v for _,v in pts]
+        thr    = cfg["thr"]
+        vmin   = max(0,   min(vals+[thr]) - 5)
+        vmax   = min(255, max(vals+[thr]) + 5)
+        vrange = max(vmax-vmin, 8)
+
+        def yx(v, tt=track_top, tb=track_bot):
+            return tt + int((1-(v-vmin)/vrange)*(tb-tt))
+
+        # Threshold line
+        thr_y = yx(thr)
+        draw.line([(PAD_L, thr_y), (W-PAD_R, thr_y)],
+                  fill=(255,200,0), width=1)
+        draw.text((PAD_L-62, thr_y-7), f"thr={thr:.0f}", fill=(200,160,0))
+
+        # ON region tint
+        draw.rectangle([PAD_L, track_top, W-PAD_R, thr_y],   fill=(0,25,10))
+        draw.rectangle([PAD_L, thr_y,     W-PAD_R, track_bot], fill=(25,8,8))
+        # Re-draw threshold on top of tint
+        draw.line([(PAD_L, thr_y), (W-PAD_R, thr_y)], fill=(200,160,0), width=1)
+
+        # Signal
+        line_pts = []
+        for t, v in pts:
+            x = xx(t)
+            if PAD_L <= x <= W-PAD_R:
+                line_pts.append((x, yx(v)))
         if len(line_pts) >= 2:
-            col_on  = cfg["col"]
-            col_off = tuple(int(c*0.5) for c in cfg["col"])
+            col_on  = col
+            col_off = tuple(int(c*0.45) for c in col)
             for i in range(len(line_pts)-1):
-                draw.line([line_pts[i], line_pts[i+1]],
-                          fill=col_on if vals[i] > cfg["thr"] else col_off, width=2)
+                c = col_on if vals[i] > thr else col_off
+                draw.line([line_pts[i], line_pts[i+1]], fill=c, width=2)
+
+        # Current value dot + label
         if line_pts:
             lx, ly = line_pts[-1]
-            dot_col = cfg["col"] if on_now else tuple(int(c*0.5) for c in cfg["col"])
-            draw.ellipse([lx-4,ly-4,lx+4,ly+4], fill=dot_col)
-            draw.text((lx+6, ly-8), f"{bright_now:.1f}", fill=dot_col)
+            dc = col if on_now else tuple(int(c*0.45) for c in col)
+            draw.ellipse([lx-4,ly-4,lx+4,ly+4], fill=dc)
+            draw.text((lx+6, ly-8), f"{bright_now:.1f}", fill=dc)
 
-    draw.text((PAD_L, GRAPH_H-PAD_B+3), "← 5s", fill=(60,60,60))
-    draw.text((PANEL_W-PAD_R-25, GRAPH_H-PAD_B+3), "now", fill=(60,60,60))
-    return img
+        # ON/OFF state badge
+        state_col = col if on_now else (100,100,100)
+        draw.text((W-PAD_R-55, tmid-7),
+                  "● ON " if on_now else "○ off",
+                  fill=state_col)
 
-def _draw_graph_single(history, cfg, on):
-    img = Image.new("RGB", (PANEL_W, GRAPH_H), (15, 15, 20))
-    draw = ImageDraw.Draw(img)
-    PAD_L, PAD_R, PAD_T, PAD_B = 50, 10, 10, 25
-    gw = PANEL_W - PAD_L - PAD_R
-    gh = GRAPH_H - PAD_T - PAD_B
-    for i in range(5):
-        draw.line([(PAD_L, PAD_T+int(i*gh/4)), (PANEL_W-PAD_R, PAD_T+int(i*gh/4))], fill=(40,40,50))
-    pts = list(history)
-    if len(pts) < 2:
-        draw.text((PAD_L+5, PAD_T+5), "Collecting data...", fill=(80,80,80))
-        return img
-    vals = [v for _,v in pts]
-    t_end = pts[-1][0]; t_span = max(5.0, pts[-1][0]-pts[0][0])
-    thr = cfg["thr"]
-    vmin = max(0, min(vals+[thr])-10); vmax = min(255, max(vals+[thr])+10)
-    vrange = max(vmax-vmin, 10)
-    def yx(v): return PAD_T+int((1-(v-vmin)/vrange)*gh)
-    def xx(t): return PAD_L+int(((t-(t_end-t_span))/t_span)*gw)
-    thr_y = yx(thr)
-    draw.rectangle([PAD_L, PAD_T, PANEL_W-PAD_R, thr_y], fill=(0,40,20))
-    draw.rectangle([PAD_L, thr_y, PANEL_W-PAD_R, PAD_T+gh], fill=(40,10,10))
-    draw.line([(PAD_L, thr_y), (PANEL_W-PAD_R, thr_y)], fill=(255,200,0), width=2)
-    draw.text((PAD_L-44, thr_y-8), f"thr={thr:.0f}", fill=(255,200,0))
-    draw.text((PAD_L-38, PAD_T+2), f"{vmax:.0f}", fill=(80,80,80))
-    draw.text((PAD_L-38, PAD_T+gh-12), f"{vmin:.0f}", fill=(80,80,80))
-    line_pts = [(xx(t), yx(v)) for t,v in pts if PAD_L <= xx(t) <= PANEL_W-PAD_R]
-    if len(line_pts) >= 2:
-        col_on = cfg["col"]; col_off = (255,80,80)
-        for i in range(len(line_pts)-1):
-            draw.line([line_pts[i], line_pts[i+1]],
-                      fill=col_on if vals[i] > thr else col_off, width=2)
-    if line_pts:
-        lx, ly = line_pts[-1]
-        dot_col = cfg["col"] if on else (255,60,60)
-        draw.ellipse([lx-4,ly-4,lx+4,ly+4], fill=dot_col)
-        draw.text((lx+6, ly-8), f"{vals[-1]:.1f}", fill=dot_col)
-    draw.text((PAD_L, GRAPH_H-PAD_B+3), "← 5s", fill=(60,60,60))
-    draw.text((PANEL_W-PAD_R-25, GRAPH_H-PAD_B+3), "now", fill=(60,60,60))
+    draw.text((PAD_L, GRAPH_H-PAD_B+2), "← ouder", fill=(50,50,55))
+    draw.text((W-PAD_R-40, GRAPH_H-PAD_B+2), "nu →", fill=(50,50,55))
     return img
 
 # ── Tkinter ───────────────────────────────────────────────────────────────────
@@ -436,8 +430,7 @@ canvas.create_text(PANEL_W+PANEL_W//2, HEADER_H+LABEL_H//2,
 
 cam0_item   = canvas.create_image(0,       CAM_Y, anchor="nw")
 cam1_item   = canvas.create_image(PANEL_W, CAM_Y, anchor="nw")
-graph0_item = canvas.create_image(0,       GRAPH_Y, anchor="nw")
-graph1_item = canvas.create_image(PANEL_W, GRAPH_Y, anchor="nw")
+graph_item  = canvas.create_image(0, GRAPH_Y, anchor="nw")
 
 canvas.create_line(0, GRAPH_Y, WIN_W, GRAPH_Y, fill="#333", width=1)
 
@@ -451,14 +444,14 @@ canvas.create_text(WIN_W-10, STATUS_Y+STATUS_H//2,
 overlay_status = canvas.create_text(10, 10, anchor="nw", state="hidden",
     fill="#888", font=("monospace", 14), text="")
 
-cam0_ph=[None]; cam1_ph=[None]; g0_ph=[None]; g1_ph=[None]
+cam0_ph=[None]; cam1_ph=[None]
 
 # ── Render loop ───────────────────────────────────────────────────────────────
 def update():
     if mode[0] == "overlay":
         canvas.itemconfig(overlay_item, state="normal",
                           image=GREEN_IMG if cam0_on[0] else RED_IMG)
-        for it in [cam0_item, cam1_item, graph0_item, graph1_item, status_item]:
+        for it in [cam0_item, cam1_item, graph_item, status_item]:
             canvas.itemconfig(it, state="hidden")
         canvas.itemconfig(overlay_status, state="normal",
             text=f"OVERLAY  fps={cam0_fps[0]:.0f}  led={'ON' if cam0_on[0] else 'OFF'}  [C=calibrate  ESC=quit]")
@@ -476,11 +469,10 @@ def update():
         p1 = ImageTk.PhotoImage(draw_cam1(f1)); cam1_ph[0]=p1
         canvas.itemconfig(cam1_item, image=p1, state="normal")
 
-        gp0 = ImageTk.PhotoImage(draw_graph0(list(hist0), cam0_on[0])); g0_ph[0]=gp0
-        canvas.itemconfig(graph0_item, image=gp0, state="normal")
-
-        gp1 = ImageTk.PhotoImage(draw_graph1(list(hist1_led), list(hist1_scr))); g1_ph[0]=gp1
-        canvas.itemconfig(graph1_item, image=gp1, state="normal")
+        graph_ph = [None]
+        gp = ImageTk.PhotoImage(draw_triple_graph(list(hist0), list(hist1_led), list(hist1_scr)))
+        graph_ph[0] = gp
+        canvas.itemconfig(graph_item, image=gp, state="normal")
 
     root.after(50, update)
 
