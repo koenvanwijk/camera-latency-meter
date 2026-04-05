@@ -42,14 +42,16 @@ WIN_W, WIN_H  = 1920, 1080
 PANEL_W       = WIN_W // 2
 HEADER_H      = 60
 LABEL_H       = 30
-CAM_H         = 430
+CAM_H         = 390
 SIGNAL_H      = 50
 GRAPH_H       = 220
+EXPLAIN_H     = 80
 STATUS_H      = 30
 CAM_Y         = HEADER_H + LABEL_H
 SIGNAL_Y      = CAM_Y + CAM_H
 GRAPH_Y       = SIGNAL_Y + SIGNAL_H
-STATUS_Y      = GRAPH_Y + GRAPH_H
+EXPLAIN_Y     = GRAPH_Y + GRAPH_H
+STATUS_Y      = EXPLAIN_Y + EXPLAIN_H
 GRAPH_HISTORY = 300
 
 # ── ROI definitions ───────────────────────────────────────────────────────────
@@ -423,6 +425,70 @@ def draw_triple_graph(h0, h_led, h_scr):
 
     return img
 
+# ── Explanation panel ──────────────────────────────────────────────────────────
+def draw_explain():
+    img = Image.new("RGB", (WIN_W, EXPLAIN_H), (8, 8, 14))
+    draw = ImageDraw.Draw(img)
+
+    ld = lat_display
+    # Pipeline breakdown (estimated component times)
+    # Total = LED1→SCR1 flank. Components:
+    #   cam1 capture latency  ≈ 1 frame @ cam1 fps
+    #   cam0 capture latency  ≈ 1 frame @ cam0 fps
+    #   TCP stream latency    ≈ network + buffer
+    #   signal bar render     ≈ tkinter 50ms poll
+    #   cam1 MJPEG latency    ≈ 1-2 frames @ cam1 fps
+
+    cam0_frame_ms = 1000/max(1, cam0_fps[0])
+    cam1_frame_ms = 1000/max(1, cam1_fps[0])
+
+    components = [
+        ("cam0 capture",   cam0_frame_ms,  (0, 200, 80)),
+        ("TCP stream",     None,           (80, 160, 255)),
+        ("UI render poll", 50.0,           (200, 200, 60)),
+        ("cam1 capture",   cam1_frame_ms,  (170, 90, 255)),
+        ("cam1 MJPEG",     cam1_frame_ms,  (255, 140, 30)),
+    ]
+    est_total = sum(v for _, v, _ in components if v is not None)
+
+    # Left: pipeline breakdown text
+    x = 10
+    draw.text((x, 6),  "Pipeline breakdown (geschat):", fill=(140,140,160), font=None)
+    x2 = 14
+    for label, val, col in components:
+        val_str = f"{val:.0f}ms" if val is not None else "?"
+        draw.text((x2, 22), f"• {label:<18} {val_str}", fill=col)
+        x2 += 160
+
+    draw.text((14, 42), f"Σ geschat = {est_total:.0f}ms", fill=(180,180,100))
+
+    # Middle: measured stats
+    if ld["last"] is not None:
+        mx = WIN_W//2 - 60
+        draw.line([(WIN_W//2-80, 5), (WIN_W//2-80, EXPLAIN_H-5)], fill=(40,40,50), width=1)
+        lines = [
+            (f"Gemeten latency (LED1→SCR1 flank)", (220,220,220)),
+            (f"  Laatste meting : {ld['last']:.1f} ms", (255,240,80)),
+            (f"  Gemiddelde     : {ld['mean']:.1f} ms", (100,200,255)),
+            (f"  Min / Max      : {ld['min']:.1f} / {ld['max']:.1f} ms", (160,160,200)),
+            (f"  Metingen       : {ld['n']}", (120,120,140)),
+        ]
+        for i, (txt, col) in enumerate(lines):
+            draw.text((WIN_W//2-70, 4 + i*15), txt, fill=col)
+    else:
+        draw.text((WIN_W//2-70, 20), "Nog geen meting — positioneer SCR1 op de balk", fill=(100,100,120))
+
+    # Right: what is being measured
+    draw.line([(WIN_W*3//4, 5), (WIN_W*3//4, EXPLAIN_H-5)], fill=(40,40,50), width=1)
+    rx = WIN_W*3//4 + 10
+    draw.text((rx,  4), "Wat meet je?", fill=(160,160,180))
+    draw.text((rx, 20), "ESP32 LED knippert → cam0 detecteert flank", fill=(100,200,120))
+    draw.text((rx, 34), "→ Python zet balk WIT op scherm", fill=(200,200,200))
+    draw.text((rx, 48), "→ cam1 ziet LED (LED1) + balk (SCR1)", fill=(180,130,255))
+    draw.text((rx, 62), "→ Δt = volledige end-to-end pipeline latency", fill=(255,200,60))
+
+    return img
+
 # ── Tkinter ───────────────────────────────────────────────────────────────────
 root = tk.Tk()
 root.title("Camera Latency Meter")
@@ -459,8 +525,10 @@ signal_bar = canvas.create_rectangle(0, SIGNAL_Y, WIN_W, SIGNAL_Y+SIGNAL_H,
 signal_txt = canvas.create_text(WIN_W//2, SIGNAL_Y+SIGNAL_H//2,
     text="○ LED OFF", fill="#ffffff", font=("monospace", 20, "bold"), anchor="center")
 
-graph_item = canvas.create_image(0, GRAPH_Y, anchor="nw")
+graph_item   = canvas.create_image(0, GRAPH_Y,   anchor="nw")
 canvas.create_line(0, GRAPH_Y, WIN_W, GRAPH_Y, fill="#333", width=1)
+explain_item = canvas.create_image(0, EXPLAIN_Y, anchor="nw")
+canvas.create_line(0, EXPLAIN_Y, WIN_W, EXPLAIN_Y, fill="#222", width=1)
 
 canvas.create_rectangle(0, STATUS_Y, WIN_W, WIN_H, fill="#0a0a0a", outline="")
 status_item = canvas.create_text(WIN_W//2, STATUS_Y+STATUS_H//2,
@@ -469,7 +537,7 @@ canvas.create_text(WIN_W-10, STATUS_Y+STATUS_H//2,
     text="S=opslaan  T=threshold  Tab=ROI wisselen  ESC",
     fill="#444", font=("monospace", 11), anchor="e")
 
-cam0_ph=[None]; cam1_ph=[None]; graph_ph=[None]
+cam0_ph=[None]; cam1_ph=[None]; graph_ph=[None]; explain_ph=[None]
 
 # ── Render loop ───────────────────────────────────────────────────────────────
 def update():
@@ -496,6 +564,10 @@ def update():
     gp = ImageTk.PhotoImage(draw_triple_graph(list(hist0), list(hist1_led), list(hist1_scr)))
     graph_ph[0] = gp
     canvas.itemconfig(graph_item, image=gp, state="normal")
+
+    ep = ImageTk.PhotoImage(draw_explain())
+    explain_ph[0] = ep
+    canvas.itemconfig(explain_item, image=ep, state="normal")
 
     root.after(50, update)
 
