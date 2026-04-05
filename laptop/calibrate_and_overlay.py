@@ -9,9 +9,9 @@ cam1 heeft twee ROIs:
 Latency = LED1 ON-flank → SCR1 ON-flank  (ms)
 
 Keys:
-  SPACE       → overlay mode (fullscreen groen/rood kruis)
-  C           → terug naar calibratie
-  T           → auto-threshold (3s, actieve ROI)
+  S           → ROI posities opslaan
+  A           → auto-threshold alle ROIs (3s)
+  T           → auto-threshold actieve ROI
   Tab         → wissel actieve cam1 ROI (LED1 ↔ SCR1)
   Linksklik   → verplaats actieve ROI
   Scroll      → vergroot/verklein ROI radius
@@ -86,7 +86,6 @@ def load_config():
 load_config()
 
 cam1_active_roi = ["led"]
-mode = ["calibrate"]
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 cam0_frame = [None]; cam0_lock = threading.Lock()
@@ -434,19 +433,6 @@ root.configure(bg="#111")
 canvas = tk.Canvas(root, bg="#111", highlightthickness=0, cursor="crosshair")
 canvas.pack(fill="both", expand=True)
 
-def make_cross_img(color, bg=(0,0,0)):
-    img = Image.new("RGB", (WIN_W, WIN_H), bg)
-    draw = ImageDraw.Draw(img)
-    cx, cy = WIN_W//2, WIN_H//2
-    arm=350; thick=80
-    draw.rectangle([cx-thick//2, cy-arm, cx+thick//2, cy+arm], fill=color)
-    draw.rectangle([cx-arm, cy-thick//2, cx+arm, cy+thick//2], fill=color)
-    return img
-
-GREEN_FULL = ImageTk.PhotoImage(make_cross_img((0,220,60)))
-RED_FULL   = ImageTk.PhotoImage(make_cross_img((220,30,30)))
-overlay_item = canvas.create_image(0, 0, anchor="nw", image=RED_FULL, state="hidden")
-
 # Header
 canvas.create_rectangle(0, 0, WIN_W, HEADER_H, fill="#0d1b2a", outline="")
 canvas.create_text(WIN_W//2, HEADER_H//2,
@@ -480,55 +466,41 @@ canvas.create_rectangle(0, STATUS_Y, WIN_W, WIN_H, fill="#0a0a0a", outline="")
 status_item = canvas.create_text(WIN_W//2, STATUS_Y+STATUS_H//2,
     text="", fill="yellow", font=("monospace", 13), anchor="center")
 canvas.create_text(WIN_W-10, STATUS_Y+STATUS_H//2,
-    text="S=opslaan  T=thr(actief)  A=thr(alles)  ↑↓=thr±1  Shift+↑↓=±10  Tab=ROI  SPACE=overlay  C=calib  ESC",
+    text="S=opslaan  A=thr(alles)  T=thr(actief)  ↑↓=thr±1  Shift+↑↓=±10  Tab=ROI  ESC",
     fill="#444", font=("monospace", 11), anchor="e")
-
-overlay_status = canvas.create_text(10, 10, anchor="nw", state="hidden",
-    fill="#888", font=("monospace", 14), text="")
 
 cam0_ph=[None]; cam1_ph=[None]; graph_ph=[None]
 
 # ── Render loop ───────────────────────────────────────────────────────────────
 def update():
-    if mode[0] == "overlay":
-        canvas.itemconfig(overlay_item, state="normal",
-                          image=GREEN_FULL if cam0_on[0] else RED_FULL)
-        for it in [cam0_item, cam1_item, graph_item, status_item, signal_bar, signal_txt]:
-            canvas.itemconfig(it, state="hidden")
-        canvas.itemconfig(overlay_status, state="normal",
-            text=f"OVERLAY  fps={cam0_fps[0]:.0f}  led={'ON' if cam0_on[0] else 'OFF'}  [C=calibrate  ESC=quit]")
+    canvas.itemconfig(status_item, state="normal", text=status_msg[0])
+    canvas.itemconfig(signal_bar,  state="normal")
+    canvas.itemconfig(signal_txt,  state="normal")
+
+    if cam0_on[0]:
+        canvas.itemconfig(signal_bar, fill="#ffffff")
+        canvas.itemconfig(signal_txt, text="● LED ON",  fill="#000000")
     else:
-        canvas.itemconfig(overlay_item,   state="hidden")
-        canvas.itemconfig(overlay_status, state="hidden")
-        canvas.itemconfig(status_item,    state="normal", text=status_msg[0])
-        canvas.itemconfig(signal_bar,     state="normal")
-        canvas.itemconfig(signal_txt,     state="normal")
+        canvas.itemconfig(signal_bar, fill="#000000")
+        canvas.itemconfig(signal_txt, text="○ LED OFF", fill="#ffffff")
 
-        if cam0_on[0]:
-            canvas.itemconfig(signal_bar, fill="#ffffff")
-            canvas.itemconfig(signal_txt, text="● LED ON",  fill="#000000")
-        else:
-            canvas.itemconfig(signal_bar, fill="#000000")
-            canvas.itemconfig(signal_txt, text="○ LED OFF", fill="#ffffff")
+    with cam0_lock: f0 = cam0_frame[0].copy() if cam0_frame[0] is not None else None
+    with cam1_lock: f1 = cam1_frame[0].copy() if cam1_frame[0] is not None else None
 
-        with cam0_lock: f0 = cam0_frame[0].copy() if cam0_frame[0] is not None else None
-        with cam1_lock: f1 = cam1_frame[0].copy() if cam1_frame[0] is not None else None
+    p0 = ImageTk.PhotoImage(draw_cam0(f0)); cam0_ph[0] = p0
+    canvas.itemconfig(cam0_item, image=p0, state="normal")
 
-        p0 = ImageTk.PhotoImage(draw_cam0(f0)); cam0_ph[0] = p0
-        canvas.itemconfig(cam0_item, image=p0, state="normal")
+    p1 = ImageTk.PhotoImage(draw_cam1(f1)); cam1_ph[0] = p1
+    canvas.itemconfig(cam1_item, image=p1, state="normal")
 
-        p1 = ImageTk.PhotoImage(draw_cam1(f1)); cam1_ph[0] = p1
-        canvas.itemconfig(cam1_item, image=p1, state="normal")
-
-        gp = ImageTk.PhotoImage(draw_triple_graph(list(hist0), list(hist1_led), list(hist1_scr)))
-        graph_ph[0] = gp
-        canvas.itemconfig(graph_item, image=gp, state="normal")
+    gp = ImageTk.PhotoImage(draw_triple_graph(list(hist0), list(hist1_led), list(hist1_scr)))
+    graph_ph[0] = gp
+    canvas.itemconfig(graph_item, image=gp, state="normal")
 
     root.after(50, update)
 
 # ── Mouse ─────────────────────────────────────────────────────────────────────
 def on_click(event):
-    if mode[0] != "calibrate": return
     x, y = event.x, event.y
     if y < CAM_Y or y > CAM_Y+CAM_H: return
     py = y - CAM_Y
@@ -542,7 +514,6 @@ def on_click(event):
     status_msg[0] = f"{cfg['label']} → ({cfg['cx']},{cfg['cy']})"
 
 def on_scroll(event):
-    if mode[0] != "calibrate": return
     delta = 1 if (event.delta > 0 or event.num == 4) else -1
     if event.x < PANEL_W:
         led0["r"] = max(2, min(60, led0["r"]+delta))
@@ -562,8 +533,6 @@ def active_cam1_cfg():
 def on_key(event):
     k = event.keysym.lower()
     if   k == "escape": root.destroy()
-    elif k == "space":  mode[0] = "overlay"
-    elif k == "c":      mode[0] = "calibrate"
     elif k == "s":      save_config()
     elif k == "t":      run_autothreshold(all_rois=False)
     elif k == "a":      run_autothreshold(all_rois=True)
