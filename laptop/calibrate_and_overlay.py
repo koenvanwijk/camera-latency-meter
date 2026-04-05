@@ -2,26 +2,23 @@
 """
 Camera Latency Meter — Calibration + Overlay
 
-Layout:
-  ┌────────────────────────────────────────────────────────────┐  ← 60px header
-  │  ESP32 LED → cam0 detects LED → overlay → cam1 ziet scherm │
-  ├─────────────────────────┬──────────────────────────────────┤  ← 30px label
-  │  CAM0  stuurt overlay   │  CAM1  MEET latency              │
-  │  [live camera 960x520]  │  [live camera 960x520]           │  ← 520px cam
-  ├─────────────────────────┼──────────────────────────────────┤
-  │  [brightness graph]     │  [brightness graph]              │  ← 150px graph
-  ├─────────────────────────┴──────────────────────────────────┤  ← 30px status
-  │  status  |  R=Gemini  T=threshold  SPACE=overlay  ESC      │
-  └────────────────────────────────────────────────────────────┘
+cam1 heeft twee ROIs:
+  • LED1   (paars)  — directe LED zichtbaar op cam1
+  • SCR1   (oranje) — het scherm zichtbaar op cam1 (cam0 overlay)
+
+De latency = tijdsverschil LED1-ON → SCR1-ON
 
 Keys:
-  SPACE  → overlay mode (wit/zwart fullscreen)
-  C      → terug naar calibratie
-  R      → Gemini LED auto-detect (beide cameras)
-  T      → auto-threshold (3s meten)
-  Klik   → verplaats LED cirkel
-  Scroll → ROI groter/kleiner
-  ESC    → afsluiten
+  SPACE       → overlay mode (wit/zwart fullscreen)
+  C           → terug naar calibratie
+  R           → Gemini LED auto-detect (beide cameras)
+  T           → auto-threshold (3s meten, actieve ROI)
+  Tab         → wissel actieve cam1 ROI (LED1 ↔ SCR1)
+  Linksklik   → verplaats actieve ROI
+  Scroll      → vergroot/verklein ROI radius
+  ↑ / ↓       → threshold ±1  (actieve ROI)
+  Shift+↑↓    → threshold ±10
+  ESC         → afsluiten
 """
 
 import argparse, socket, time, threading, base64, json, collections
@@ -39,23 +36,32 @@ parser.add_argument("--win-x",     type=int, default=0)
 parser.add_argument("--win-y",     type=int, default=0)
 args = parser.parse_args()
 
-GEMINI_KEY   = os.environ.get("GEMINI_API_KEY", "AIzaSyC2PBKX4PqU3nr7GRBdkUCkymll2ulesJ8")
-GEMINI_URL   = ("https://generativelanguage.googleapis.com/v1beta/models/"
-                "gemini-flash-lite-latest:generateContent?key=" + GEMINI_KEY)
+GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "AIzaSyC2PBKX4PqU3nr7GRBdkUCkymll2ulesJ8")
+GEMINI_URL = ("https://generativelanguage.googleapis.com/v1beta/models/"
+              "gemini-flash-lite-latest:generateContent?key=" + GEMINI_KEY)
 
 WIN_W, WIN_H  = 1920, 1080
-PANEL_W       = WIN_W // 2   # 960
+PANEL_W       = WIN_W // 2
 HEADER_H      = 60
 LABEL_H       = 30
-CAM_H         = 520
+CAM_H         = 510
 GRAPH_H       = 150
 STATUS_H      = 30
-# Sanity: HEADER_H + LABEL_H + CAM_H + GRAPH_H + STATUS_H = 790; rest is padding
 CAM_Y         = HEADER_H + LABEL_H
 GRAPH_Y       = CAM_Y + CAM_H
 STATUS_Y      = GRAPH_Y + GRAPH_H
+GRAPH_HISTORY = 300
 
-GRAPH_HISTORY = 300  # samples in graph
+# ── ROI definitions ───────────────────────────────────────────────────────────
+# cam0: one LED ROI
+led0 = {"cx": 460, "cy": 164, "r": 12, "thr": 35.0, "label": "LED0", "col": (0, 230, 80)}
+
+# cam1: two ROIs
+led1 = {"cx": 869, "cy": 349, "r": 12, "thr": 30.0, "label": "LED1", "col": (180, 100, 255)}
+scr1 = {"cx": 400, "cy": 200, "r": 20, "thr": 128.0, "label": "SCR1", "col": (255, 160, 40)}
+
+# Which cam1 ROI is "active" for clicks/threshold keys
+cam1_active_roi = ["led"]   # "led" | "scr"
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 mode = ["calibrate"]
@@ -63,14 +69,13 @@ mode = ["calibrate"]
 cam0_frame = [None]; cam0_lock = threading.Lock()
 cam1_frame = [None]; cam1_lock = threading.Lock()
 
-led0 = {"cx": 460, "cy": 164, "r": 12, "thr": 35.0}
-led1 = {"cx": 869, "cy": 349, "r": 12, "thr": 30.0}
-
 cam0_bright = [0.0]; cam0_on = [False]; cam0_fps = [0.0]
-cam1_bright = [0.0]; cam1_on = [False]; cam1_fps = [0.0]
+cam1_led_bright = [0.0]; cam1_led_on = [False]
+cam1_scr_bright = [0.0]; cam1_scr_on = [False]; cam1_fps = [0.0]
 
-hist0 = collections.deque(maxlen=GRAPH_HISTORY)  # (time, brightness)
-hist1 = collections.deque(maxlen=GRAPH_HISTORY)
+hist0     = collections.deque(maxlen=GRAPH_HISTORY)
+hist1_led = collections.deque(maxlen=GRAPH_HISTORY)
+hist1_scr = collections.deque(maxlen=GRAPH_HISTORY)
 
 status_msg    = ["Auto-detecting LEDs with Gemini..."]
 gemini_running = [False]
@@ -134,12 +139,22 @@ def cam1_loop():
                     arr = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_COLOR)
                     if arr is None: continue
                     gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+                    now = time.time()
+
                     cx, cy, r = led1["cx"], led1["cy"], led1["r"]
                     roi = gray[max(0,cy-r):cy+r, max(0,cx-r):cx+r]
-                    v = float(roi.mean()) if roi.size > 0 else 0.0
-                    cam1_bright[0] = v
-                    cam1_on[0] = v > led1["thr"]
-                    hist1.append((time.time(), v))
+                    vl = float(roi.mean()) if roi.size > 0 else 0.0
+                    cam1_led_bright[0] = vl
+                    cam1_led_on[0] = vl > led1["thr"]
+                    hist1_led.append((now, vl))
+
+                    cx, cy, r = scr1["cx"], scr1["cy"], scr1["r"]
+                    roi = gray[max(0,cy-r):cy+r, max(0,cx-r):cx+r]
+                    vs = float(roi.mean()) if roi.size > 0 else 0.0
+                    cam1_scr_bright[0] = vs
+                    cam1_scr_on[0] = vs > scr1["thr"]
+                    hist1_scr.append((now, vs))
+
                     with cam1_lock: cam1_frame[0] = arr
                     fc += 1
                     if fc % 30 == 0:
@@ -152,14 +167,14 @@ threading.Thread(target=cam0_loop, daemon=True).start()
 threading.Thread(target=cam1_loop, daemon=True).start()
 
 # ── Gemini ────────────────────────────────────────────────────────────────────
-def gemini_detect(img_bgr, label):
+def gemini_detect(img_bgr, prompt_extra=""):
     h, w = img_bgr.shape[:2]
     jpg = cv2.imencode(".jpg", img_bgr, [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
     b64 = base64.b64encode(jpg).decode()
     body = json.dumps({"contents": [{"parts": [
         {"text": (f"Camera {w}x{h}px robotics latency setup. "
-                  "Find the blinking LED. Return ONLY JSON: "
-                  "{\"cx\": <0-1000>, \"cy\": <0-1000>} normalized. No markdown.")},
+                  f"Find the blinking LED{prompt_extra}. Return ONLY JSON: "
+                  "{\"cx\": <0-1000>, \"cy\": <0-1000>} normalized coords. No markdown.")},
         {"inline_data": {"mime_type": "image/jpeg", "data": b64}}
     ]}]}).encode()
     req = urllib.request.Request(GEMINI_URL, data=body,
@@ -168,10 +183,7 @@ def gemini_detect(img_bgr, label):
     text = resp["candidates"][0]["content"]["parts"][0]["text"].strip().strip("`").strip()
     if text.lower().startswith("json"): text = text[4:].strip()
     r = json.loads(text)
-    cx = int(int(r["cx"]) / 1000 * w)
-    cy = int(int(r["cy"]) / 1000 * h)
-    print(f"Gemini {label}: ({cx},{cy})", flush=True)
-    return cx, cy
+    return int(int(r["cx"]) / 1000 * w), int(int(r["cy"]) / 1000 * h)
 
 def run_gemini():
     if gemini_running[0]: return
@@ -182,141 +194,203 @@ def run_gemini():
         with cam1_lock: f1 = cam1_frame[0].copy() if cam1_frame[0] is not None else None
         errs = []
         if f0 is not None:
-            try:
-                led0["cx"], led0["cy"] = gemini_detect(f0, "cam0")
+            try: led0["cx"], led0["cy"] = gemini_detect(f0)
             except Exception as ex: errs.append(f"cam0:{ex}")
         if f1 is not None:
-            try:
-                led1["cx"], led1["cy"] = gemini_detect(f1, "cam1")
+            try: led1["cx"], led1["cy"] = gemini_detect(f1)
             except Exception as ex: errs.append(f"cam1:{ex}")
         if errs:
             status_msg[0] = "Gemini errors: " + " | ".join(str(e) for e in errs)
         else:
             status_msg[0] = (f"Gemini ✓  cam0=({led0['cx']},{led0['cy']})  "
-                             f"cam1=({led1['cx']},{led1['cy']})")
+                             f"LED1=({led1['cx']},{led1['cy']})")
         gemini_running[0] = False
     threading.Thread(target=_run, daemon=True).start()
 
 def run_autothreshold():
+    active = led1 if cam1_active_roi[0] == "led" else scr1
     def _run():
-        status_msg[0] = "Auto-threshold: collecting 3s..."
-        v0, v1 = [], []
+        status_msg[0] = f"Auto-threshold {active['label']}: collecting 3s..."
+        v0, va = [], []
         t = time.time()
         while time.time()-t < 3.5:
-            v0.append(cam0_bright[0]); v1.append(cam1_bright[0])
+            v0.append(cam0_bright[0])
+            va.append(cam1_led_bright[0] if cam1_active_roi[0] == "led" else cam1_scr_bright[0])
             time.sleep(0.02)
-        for vals, led, name in [(v0, led0, "cam0"), (v1, led1, "cam1")]:
+        for vals, cfg in [(v0, led0), (va, active)]:
             mn, mx = min(vals), max(vals)
-            if mx-mn > 4: led["thr"] = (mn+mx)/2
-        status_msg[0] = f"Threshold ✓  cam0={led0['thr']:.0f}  cam1={led1['thr']:.0f}"
+            if mx-mn > 4: cfg["thr"] = (mn+mx)/2
+        status_msg[0] = (f"Threshold ✓  cam0={led0['thr']:.0f}  "
+                         f"{active['label']}={active['thr']:.0f}")
     threading.Thread(target=_run, daemon=True).start()
 
 # ── Draw camera panel ──────────────────────────────────────────────────────────
-def draw_cam(frame_bgr, led_cfg, bright, on, scale):
+def draw_cam0(frame_bgr):
     img = Image.new("RGB", (PANEL_W, CAM_H), (25, 25, 25))
     if frame_bgr is None:
-        draw = ImageDraw.Draw(img)
-        draw.text((PANEL_W//2 - 70, CAM_H//2), "Waiting for stream...", fill=(120,120,120))
-        scale["ox"] = scale["oy"] = 0; scale["r"] = 1.0
+        ImageDraw.Draw(img).text((20, CAM_H//2), "Waiting for stream...", fill=(100,100,100))
+        scale0["ox"] = scale0["oy"] = 0; scale0["r"] = 1.0
         return img
-
     h, w = frame_bgr.shape[:2]
     ratio = min(PANEL_W/w, CAM_H/h)
     nw, nh = int(w*ratio), int(h*ratio)
     ox = (PANEL_W-nw)//2; oy = (CAM_H-nh)//2
-    scale["ox"] = ox; scale["oy"] = oy; scale["r"] = ratio
-
-    cam_img = Image.fromarray(cv2.cvtColor(
-        cv2.resize(frame_bgr, (nw, nh)), cv2.COLOR_BGR2RGB))
-    img.paste(cam_img, (ox, oy))
+    scale0["ox"] = ox; scale0["oy"] = oy; scale0["r"] = ratio
+    img.paste(Image.fromarray(cv2.cvtColor(cv2.resize(frame_bgr,(nw,nh)), cv2.COLOR_BGR2RGB)), (ox,oy))
     draw = ImageDraw.Draw(img)
-
-    # LED circle
-    cx_d = int(led_cfg["cx"]*ratio) + ox
-    cy_d = int(led_cfg["cy"]*ratio) + oy
-    r_d  = max(5, int(led_cfg["r"]*ratio))
-    col = (0,255,80) if on else (255,60,60)
-    draw.ellipse([cx_d-r_d, cy_d-r_d, cx_d+r_d, cy_d+r_d], outline=col, width=3)
-    draw.line([(cx_d-r_d-10, cy_d), (cx_d+r_d+10, cy_d)], fill=col, width=1)
-    draw.line([(cx_d, cy_d-r_d-10), (cx_d, cy_d+r_d+10)], fill=col, width=1)
-    # Brightness label
-    draw.text((cx_d+r_d+5, cy_d-9), f"{bright:.1f}", fill=col)
-
+    _draw_roi(draw, led0, cam0_bright[0], cam0_on[0], ratio, ox, oy)
     return img
 
+def draw_cam1(frame_bgr):
+    img = Image.new("RGB", (PANEL_W, CAM_H), (25, 25, 25))
+    if frame_bgr is None:
+        ImageDraw.Draw(img).text((20, CAM_H//2), "Waiting for stream...", fill=(100,100,100))
+        scale1["ox"] = scale1["oy"] = 0; scale1["r"] = 1.0
+        return img
+    h, w = frame_bgr.shape[:2]
+    ratio = min(PANEL_W/w, CAM_H/h)
+    nw, nh = int(w*ratio), int(h*ratio)
+    ox = (PANEL_W-nw)//2; oy = (CAM_H-nh)//2
+    scale1["ox"] = ox; scale1["oy"] = oy; scale1["r"] = ratio
+    img.paste(Image.fromarray(cv2.cvtColor(cv2.resize(frame_bgr,(nw,nh)), cv2.COLOR_BGR2RGB)), (ox,oy))
+    draw = ImageDraw.Draw(img)
+    # Draw inactive ROI first (dimmer)
+    if cam1_active_roi[0] == "led":
+        _draw_roi(draw, scr1, cam1_scr_bright[0], cam1_scr_on[0], ratio, ox, oy, alpha=0.4, active=False)
+        _draw_roi(draw, led1, cam1_led_bright[0], cam1_led_on[0], ratio, ox, oy, active=True)
+    else:
+        _draw_roi(draw, led1, cam1_led_bright[0], cam1_led_on[0], ratio, ox, oy, alpha=0.4, active=False)
+        _draw_roi(draw, scr1, cam1_scr_bright[0], cam1_scr_on[0], ratio, ox, oy, active=True)
+    # Active ROI label
+    active = led1 if cam1_active_roi[0] == "led" else scr1
+    draw.text((8, 8), f"[Tab] actief: {active['label']}", fill=active["col"])
+    return img
+
+def _draw_roi(draw, cfg, bright, on, ratio, ox, oy, alpha=1.0, active=True):
+    cx_d = int(cfg["cx"]*ratio) + ox
+    cy_d = int(cfg["cy"]*ratio) + oy
+    r_d  = max(5, int(cfg["r"]*ratio))
+    base = cfg["col"]
+    col = tuple(int(c * (0.5 if not active else 1.0)) for c in base)
+    lw = 3 if active else 1
+    draw.ellipse([cx_d-r_d, cy_d-r_d, cx_d+r_d, cy_d+r_d], outline=col, width=lw)
+    if active:
+        draw.line([(cx_d-r_d-10, cy_d), (cx_d+r_d+10, cy_d)], fill=col, width=1)
+        draw.line([(cx_d, cy_d-r_d-10), (cx_d, cy_d+r_d+10)], fill=col, width=1)
+    # Label + brightness
+    label_col = col if on else tuple(int(c*0.6) for c in col)
+    state = "ON" if on else "off"
+    draw.text((cx_d+r_d+5, cy_d-18), cfg["label"], fill=col)
+    draw.text((cx_d+r_d+5, cy_d-4),  f"{bright:.1f} {state}", fill=label_col)
+
 # ── Draw brightness graph ──────────────────────────────────────────────────────
-def draw_graph(history, led_cfg, on, label_color):
-    """Returns PIL image PANEL_W x GRAPH_H with time-series + threshold lines."""
+def draw_graph0(history, on):
+    return _draw_graph_single(history, led0, on)
+
+def draw_graph1(h_led, h_scr):
+    """cam1 graph shows both LED1 and SCR1 signals."""
     img = Image.new("RGB", (PANEL_W, GRAPH_H), (15, 15, 20))
     draw = ImageDraw.Draw(img)
-
     PAD_L, PAD_R, PAD_T, PAD_B = 50, 10, 10, 25
     gw = PANEL_W - PAD_L - PAD_R
     gh = GRAPH_H - PAD_T - PAD_B
 
-    # Background grid
+    # Grid
     for i in range(5):
         y = PAD_T + int(i * gh / 4)
         draw.line([(PAD_L, y), (PANEL_W-PAD_R, y)], fill=(40,40,50), width=1)
 
-    if len(history) < 2:
+    pts_led = list(h_led)
+    pts_scr = list(h_scr)
+    if not pts_led and not pts_scr:
         draw.text((PAD_L+5, PAD_T+5), "Collecting data...", fill=(80,80,80))
         return img
 
-    pts = list(history)
-    vals = [v for _, v in pts]
-    t_end = pts[-1][0]
-    t_span = max(5.0, pts[-1][0] - pts[0][0])
-
-    # Y range: show range around threshold with some margin
-    thr = led_cfg["thr"]
-    all_vals = vals + [thr]
-    vmin = max(0, min(all_vals) - 10)
+    all_vals = [v for _,v in pts_led] + [v for _,v in pts_scr] + [led1["thr"], scr1["thr"]]
+    vmin = max(0,   min(all_vals) - 10)
     vmax = min(255, max(all_vals) + 10)
     vrange = max(vmax - vmin, 10)
 
-    def yx(v):
-        return PAD_T + int((1 - (v - vmin) / vrange) * gh)
-    def xx(t):
-        return PAD_L + int(((t - (t_end - t_span)) / t_span) * gw)
+    t_end  = max((pts_led[-1][0] if pts_led else 0), (pts_scr[-1][0] if pts_scr else 0))
+    t_span = max(5.0, t_end - min(
+        (pts_led[0][0] if pts_led else t_end),
+        (pts_scr[0][0] if pts_scr else t_end)))
 
-    # Threshold band (filled area between ON zone and threshold)
-    thr_y = yx(thr)
-    # Subtle fill for ON region
-    draw.rectangle([PAD_L, PAD_T, PANEL_W-PAD_R, thr_y], fill=(0, 40, 20))
-    draw.rectangle([PAD_L, thr_y, PANEL_W-PAD_R, PAD_T+gh], fill=(40, 10, 10))
+    def yx(v): return PAD_T + int((1-(v-vmin)/vrange)*gh)
+    def xx(t): return PAD_L + int(((t-(t_end-t_span))/t_span)*gw)
 
-    # Threshold line
-    draw.line([(PAD_L, thr_y), (PANEL_W-PAD_R, thr_y)], fill=(255, 200, 0), width=2)
-    draw.text((PAD_L - 44, thr_y - 8), f"thr={thr:.0f}", fill=(255, 200, 0))
+    # Threshold lines
+    for cfg, label_off in [(led1, 0), (scr1, 12)]:
+        ty = yx(cfg["thr"])
+        draw.line([(PAD_L, ty), (PANEL_W-PAD_R, ty)],
+                  fill=tuple(int(c*0.7) for c in cfg["col"]), width=1)
+        draw.text((PAD_L-44, ty-8+label_off),
+                  f"{cfg['label']}={cfg['thr']:.0f}",
+                  fill=tuple(int(c*0.7) for c in cfg["col"]))
 
-    # Upper / lower labels
-    draw.text((PAD_L - 38, PAD_T + 2),  f"{vmax:.0f}", fill=(80, 80, 80))
-    draw.text((PAD_L - 38, PAD_T+gh-12), f"{vmin:.0f}", fill=(80, 80, 80))
+    # Signal lines
+    for pts, cfg, bright_now, on_now in [
+        (pts_led, led1, cam1_led_bright[0], cam1_led_on[0]),
+        (pts_scr, scr1, cam1_scr_bright[0], cam1_scr_on[0]),
+    ]:
+        if len(pts) < 2: continue
+        vals = [v for _,v in pts]
+        line_pts = [(xx(t), yx(v)) for t,v in pts if PAD_L <= xx(t) <= PANEL_W-PAD_R]
+        if len(line_pts) >= 2:
+            col_on  = cfg["col"]
+            col_off = tuple(int(c*0.5) for c in cfg["col"])
+            for i in range(len(line_pts)-1):
+                draw.line([line_pts[i], line_pts[i+1]],
+                          fill=col_on if vals[i] > cfg["thr"] else col_off, width=2)
+        if line_pts:
+            lx, ly = line_pts[-1]
+            dot_col = cfg["col"] if on_now else tuple(int(c*0.5) for c in cfg["col"])
+            draw.ellipse([lx-4,ly-4,lx+4,ly+4], fill=dot_col)
+            draw.text((lx+6, ly-8), f"{bright_now:.1f}", fill=dot_col)
 
-    # Signal line
-    line_pts = []
-    for t, v in pts:
-        x = xx(t); y = yx(v)
-        if PAD_L <= x <= PANEL_W-PAD_R:
-            line_pts.append((x, y))
-    if len(line_pts) >= 2:
-        # Color segments ON/OFF
-        for i in range(len(line_pts)-1):
-            col = (0, 230, 80) if vals[i] > thr else (255, 80, 80)
-            draw.line([line_pts[i], line_pts[i+1]], fill=col, width=2)
-
-    # Current value dot
-    if line_pts:
-        lx, ly = line_pts[-1]
-        dot_col = (0,255,80) if on else (255,60,60)
-        draw.ellipse([lx-4, ly-4, lx+4, ly+4], fill=dot_col)
-        draw.text((lx+6, ly-8), f"{vals[-1]:.1f}", fill=dot_col)
-
-    # X axis label
     draw.text((PAD_L, GRAPH_H-PAD_B+3), "← 5s", fill=(60,60,60))
     draw.text((PANEL_W-PAD_R-25, GRAPH_H-PAD_B+3), "now", fill=(60,60,60))
+    return img
 
+def _draw_graph_single(history, cfg, on):
+    img = Image.new("RGB", (PANEL_W, GRAPH_H), (15, 15, 20))
+    draw = ImageDraw.Draw(img)
+    PAD_L, PAD_R, PAD_T, PAD_B = 50, 10, 10, 25
+    gw = PANEL_W - PAD_L - PAD_R
+    gh = GRAPH_H - PAD_T - PAD_B
+    for i in range(5):
+        draw.line([(PAD_L, PAD_T+int(i*gh/4)), (PANEL_W-PAD_R, PAD_T+int(i*gh/4))], fill=(40,40,50))
+    pts = list(history)
+    if len(pts) < 2:
+        draw.text((PAD_L+5, PAD_T+5), "Collecting data...", fill=(80,80,80))
+        return img
+    vals = [v for _,v in pts]
+    t_end = pts[-1][0]; t_span = max(5.0, pts[-1][0]-pts[0][0])
+    thr = cfg["thr"]
+    vmin = max(0, min(vals+[thr])-10); vmax = min(255, max(vals+[thr])+10)
+    vrange = max(vmax-vmin, 10)
+    def yx(v): return PAD_T+int((1-(v-vmin)/vrange)*gh)
+    def xx(t): return PAD_L+int(((t-(t_end-t_span))/t_span)*gw)
+    thr_y = yx(thr)
+    draw.rectangle([PAD_L, PAD_T, PANEL_W-PAD_R, thr_y], fill=(0,40,20))
+    draw.rectangle([PAD_L, thr_y, PANEL_W-PAD_R, PAD_T+gh], fill=(40,10,10))
+    draw.line([(PAD_L, thr_y), (PANEL_W-PAD_R, thr_y)], fill=(255,200,0), width=2)
+    draw.text((PAD_L-44, thr_y-8), f"thr={thr:.0f}", fill=(255,200,0))
+    draw.text((PAD_L-38, PAD_T+2), f"{vmax:.0f}", fill=(80,80,80))
+    draw.text((PAD_L-38, PAD_T+gh-12), f"{vmin:.0f}", fill=(80,80,80))
+    line_pts = [(xx(t), yx(v)) for t,v in pts if PAD_L <= xx(t) <= PANEL_W-PAD_R]
+    if len(line_pts) >= 2:
+        col_on = cfg["col"]; col_off = (255,80,80)
+        for i in range(len(line_pts)-1):
+            draw.line([line_pts[i], line_pts[i+1]],
+                      fill=col_on if vals[i] > thr else col_off, width=2)
+    if line_pts:
+        lx, ly = line_pts[-1]
+        dot_col = cfg["col"] if on else (255,60,60)
+        draw.ellipse([lx-4,ly-4,lx+4,ly+4], fill=dot_col)
+        draw.text((lx+6, ly-8), f"{vals[-1]:.1f}", fill=dot_col)
+    draw.text((PAD_L, GRAPH_H-PAD_B+3), "← 5s", fill=(60,60,60))
+    draw.text((PANEL_W-PAD_R-25, GRAPH_H-PAD_B+3), "now", fill=(60,60,60))
     return img
 
 # ── Tkinter ───────────────────────────────────────────────────────────────────
@@ -335,14 +409,12 @@ overlay_item = canvas.create_image(0, 0, anchor="nw", image=BLACK_IMG, state="hi
 
 # Header
 canvas.create_rectangle(0, 0, WIN_W, HEADER_H, fill="#0d1b2a", outline="")
-pipeline_txt = "ESP32 LED  →  cam0 detecteert LED  →  overlay wit/zwart op scherm  →  cam1 ziet scherm  →  LATENCY"
-canvas.create_text(WIN_W//2, HEADER_H//2, text=pipeline_txt,
-                   fill="#4fc3f7", font=("monospace", 13, "bold"), anchor="center")
+canvas.create_text(WIN_W//2, HEADER_H//2,
+    text="ESP32 LED  →  cam0 detecteert LED  →  overlay wit/zwart op scherm  →  cam1 ziet LED + SCHERM  →  LATENCY",
+    fill="#4fc3f7", font=("monospace", 13, "bold"), anchor="center")
 
-# Divider
 canvas.create_line(PANEL_W, HEADER_H, PANEL_W, WIN_H-STATUS_H, fill="#333", width=2)
 
-# Cam labels
 canvas.create_rectangle(0,       HEADER_H, PANEL_W, HEADER_H+LABEL_H, fill="#0d3b2e", outline="")
 canvas.create_text(PANEL_W//2, HEADER_H+LABEL_H//2,
     text="CAM0  —  detecteert LED  →  stuurt overlay naar scherm",
@@ -350,95 +422,82 @@ canvas.create_text(PANEL_W//2, HEADER_H+LABEL_H//2,
 
 canvas.create_rectangle(PANEL_W, HEADER_H, WIN_W, HEADER_H+LABEL_H, fill="#2d1b4e", outline="")
 canvas.create_text(PANEL_W+PANEL_W//2, HEADER_H+LABEL_H//2,
-    text="CAM1  —  ziet LED + SCHERM  →  MEET volledige latency",
+    text="CAM1  —  ziet LED (paars) + SCHERM (oranje)  →  MEET latency",
     fill="#ce93d8", font=("monospace", 13, "bold"), anchor="center")
 
-# Camera image slots
-cam0_item  = canvas.create_image(0,       CAM_Y, anchor="nw")
-cam1_item  = canvas.create_image(PANEL_W, CAM_Y, anchor="nw")
-
-# Graph slots
+cam0_item   = canvas.create_image(0,       CAM_Y, anchor="nw")
+cam1_item   = canvas.create_image(PANEL_W, CAM_Y, anchor="nw")
 graph0_item = canvas.create_image(0,       GRAPH_Y, anchor="nw")
 graph1_item = canvas.create_image(PANEL_W, GRAPH_Y, anchor="nw")
 
-# Graph label line
 canvas.create_line(0, GRAPH_Y, WIN_W, GRAPH_Y, fill="#333", width=1)
 
-# Status bar
 canvas.create_rectangle(0, STATUS_Y, WIN_W, WIN_H, fill="#0a0a0a", outline="")
-status_item = canvas.create_text(WIN_W//2, STATUS_Y + STATUS_H//2,
+status_item = canvas.create_text(WIN_W//2, STATUS_Y+STATUS_H//2,
     text="", fill="yellow", font=("monospace", 13), anchor="center")
-canvas.create_text(WIN_W-10, STATUS_Y + STATUS_H//2,
-    text="R=Gemini  T=auto-thr  ↑↓=threshold±1  Shift+↑↓=±10  SPACE=overlay  C=calib  ESC=quit",
-    fill="#444", font=("monospace", 12), anchor="e")
+canvas.create_text(WIN_W-10, STATUS_Y+STATUS_H//2,
+    text="R=Gemini  T=auto-thr  ↑↓=thr±1  Shift+↑↓=±10  Tab=wissel ROI  SPACE=overlay  C=calib  ESC",
+    fill="#444", font=("monospace", 11), anchor="e")
 
-# Overlay status
 overlay_status = canvas.create_text(10, 10, anchor="nw", state="hidden",
     fill="#888", font=("monospace", 14), text="")
 
-cam0_photo = [None]; cam1_photo = [None]
-graph0_photo = [None]; graph1_photo = [None]
+cam0_ph=[None]; cam1_ph=[None]; g0_ph=[None]; g1_ph=[None]
 
 # ── Render loop ───────────────────────────────────────────────────────────────
 def update():
     if mode[0] == "overlay":
         canvas.itemconfig(overlay_item, state="normal",
                           image=WHITE_IMG if cam0_on[0] else BLACK_IMG)
-        for item in [cam0_item, cam1_item, graph0_item, graph1_item, status_item]:
-            canvas.itemconfig(item, state="hidden")
+        for it in [cam0_item, cam1_item, graph0_item, graph1_item, status_item]:
+            canvas.itemconfig(it, state="hidden")
         canvas.itemconfig(overlay_status, state="normal",
-                          text=f"OVERLAY  fps={cam0_fps[0]:.0f}  led={'ON' if cam0_on[0] else 'OFF'}  [C=calibrate  ESC=quit]")
+            text=f"OVERLAY  fps={cam0_fps[0]:.0f}  led={'ON' if cam0_on[0] else 'OFF'}  [C=calibrate  ESC=quit]")
     else:
-        canvas.itemconfig(overlay_item,   state="hidden")
+        canvas.itemconfig(overlay_item, state="hidden")
         canvas.itemconfig(overlay_status, state="hidden")
-        canvas.itemconfig(status_item,    state="normal", text=status_msg[0])
+        canvas.itemconfig(status_item, state="normal", text=status_msg[0])
 
         with cam0_lock: f0 = cam0_frame[0].copy() if cam0_frame[0] is not None else None
         with cam1_lock: f1 = cam1_frame[0].copy() if cam1_frame[0] is not None else None
 
-        # Camera panels
-        img0 = draw_cam(f0, led0, cam0_bright[0], cam0_on[0], scale0)
-        p0 = ImageTk.PhotoImage(img0)
-        cam0_photo[0] = p0
+        p0 = ImageTk.PhotoImage(draw_cam0(f0)); cam0_ph[0]=p0
         canvas.itemconfig(cam0_item, image=p0, state="normal")
 
-        img1 = draw_cam(f1, led1, cam1_bright[0], cam1_on[0], scale1)
-        p1 = ImageTk.PhotoImage(img1)
-        cam1_photo[0] = p1
+        p1 = ImageTk.PhotoImage(draw_cam1(f1)); cam1_ph[0]=p1
         canvas.itemconfig(cam1_item, image=p1, state="normal")
 
-        # Graphs
-        g0 = draw_graph(list(hist0), led0, cam0_on[0], (0,230,80))
-        gp0 = ImageTk.PhotoImage(g0)
-        graph0_photo[0] = gp0
+        gp0 = ImageTk.PhotoImage(draw_graph0(list(hist0), cam0_on[0])); g0_ph[0]=gp0
         canvas.itemconfig(graph0_item, image=gp0, state="normal")
 
-        g1 = draw_graph(list(hist1), led1, cam1_on[0], (206,147,216))
-        gp1 = ImageTk.PhotoImage(g1)
-        graph1_photo[0] = gp1
+        gp1 = ImageTk.PhotoImage(draw_graph1(list(hist1_led), list(hist1_scr))); g1_ph[0]=gp1
         canvas.itemconfig(graph1_item, image=gp1, state="normal")
 
-    root.after(50, update)  # 20fps UI (camera runs faster in background)
+    root.after(50, update)
 
 # ── Mouse ─────────────────────────────────────────────────────────────────────
 def on_click(event):
     if mode[0] != "calibrate": return
     x, y = event.x, event.y
-    if y < CAM_Y or y > CAM_Y + CAM_H: return
+    if y < CAM_Y or y > CAM_Y+CAM_H: return
     py = y - CAM_Y
     if x < PANEL_W:
-        led, sc, px = led0, scale0, x
+        cfg, sc, px = led0, scale0, x
     else:
-        led, sc, px = led1, scale1, x - PANEL_W
-    led["cx"] = max(0, int((px - sc["ox"]) / sc["r"]))
-    led["cy"] = max(0, int((py - sc["oy"]) / sc["r"]))
-    status_msg[0] = f"LED moved to ({led['cx']},{led['cy']})"
+        cfg = led1 if cam1_active_roi[0]=="led" else scr1
+        sc, px = scale1, x-PANEL_W
+    cfg["cx"] = max(0, int((px-sc["ox"])/sc["r"]))
+    cfg["cy"] = max(0, int((py-sc["oy"])/sc["r"]))
+    status_msg[0] = f"{cfg['label']} moved to ({cfg['cx']},{cfg['cy']})"
 
 def on_scroll(event):
     if mode[0] != "calibrate": return
     delta = 1 if (event.delta > 0 or event.num == 4) else -1
-    led = led0 if event.x < PANEL_W else led1
-    led["r"] = max(2, min(60, led["r"] + delta))
+    if event.x < PANEL_W:
+        led0["r"] = max(2, min(60, led0["r"]+delta))
+    else:
+        cfg = led1 if cam1_active_roi[0]=="led" else scr1
+        cfg["r"] = max(2, min(80, cfg["r"]+delta))
 
 canvas.bind("<Button-1>", on_click)
 canvas.bind("<MouseWheel>", on_scroll)
@@ -446,6 +505,9 @@ canvas.bind("<Button-4>", on_scroll)
 canvas.bind("<Button-5>", on_scroll)
 
 # ── Keys ──────────────────────────────────────────────────────────────────────
+def active_cam1_cfg():
+    return led1 if cam1_active_roi[0]=="led" else scr1
+
 def on_key(event):
     k = event.keysym.lower()
     if   k == "escape": root.destroy()
@@ -453,25 +515,18 @@ def on_key(event):
     elif k == "c":      mode[0] = "calibrate"
     elif k == "r":      threading.Thread(target=run_gemini, daemon=True).start()
     elif k == "t":      run_autothreshold()
-    elif k == "up":
-        led0["thr"] = min(255, led0["thr"] + 1)
-        led1["thr"] = min(255, led1["thr"] + 1)
-        status_msg[0] = f"Threshold ↑  cam0={led0['thr']:.0f}  cam1={led1['thr']:.0f}"
-    elif k == "down":
-        led0["thr"] = max(0, led0["thr"] - 1)
-        led1["thr"] = max(0, led1["thr"] - 1)
-        status_msg[0] = f"Threshold ↓  cam0={led0['thr']:.0f}  cam1={led1['thr']:.0f}"
-    elif k == "shift_l" or k == "shift_r":
-        pass  # modifier only
-    # Shift+arrow = grote stap (10)
-    elif event.keysym == "Up" and event.state & 1:
-        led0["thr"] = min(255, led0["thr"] + 10)
-        led1["thr"] = min(255, led1["thr"] + 10)
-        status_msg[0] = f"Threshold ↑↑  cam0={led0['thr']:.0f}  cam1={led1['thr']:.0f}"
-    elif event.keysym == "Down" and event.state & 1:
-        led0["thr"] = max(0, led0["thr"] - 10)
-        led1["thr"] = max(0, led1["thr"] - 10)
-        status_msg[0] = f"Threshold ↓↓  cam0={led0['thr']:.0f}  cam1={led1['thr']:.0f}"
+    elif k == "tab":
+        cam1_active_roi[0] = "scr" if cam1_active_roi[0]=="led" else "led"
+        active = active_cam1_cfg()
+        status_msg[0] = f"Actieve cam1 ROI: {active['label']}"
+    elif k in ("up", "down"):
+        step = 10 if (event.state & 1) else 1
+        delta = step if k=="up" else -step
+        led0["thr"]   = max(0, min(255, led0["thr"]   + delta))
+        active = active_cam1_cfg()
+        active["thr"] = max(0, min(255, active["thr"] + delta))
+        status_msg[0] = (f"Threshold {'↑' if delta>0 else '↓'}  "
+                         f"cam0={led0['thr']:.0f}  {active['label']}={active['thr']:.0f}")
 
 root.bind("<Key>", on_key)
 
@@ -479,5 +534,5 @@ root.after(2000, lambda: threading.Thread(target=run_gemini, daemon=True).start(
 root.after(50, update)
 
 print(f"Camera Latency Meter | cam0 TCP {args.jetson}:{args.cam0_port} | cam1 {args.cam1_url}")
-print("Keys: SPACE=overlay  C=calibrate  R=Gemini  T=threshold  click=move LED  ESC=quit")
+print("Tab=wissel cam1 ROI (LED1/SCR1)  SPACE=overlay  R=Gemini  T=threshold  ESC=quit")
 root.mainloop()
