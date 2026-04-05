@@ -466,7 +466,7 @@ canvas.create_rectangle(0, STATUS_Y, WIN_W, WIN_H, fill="#0a0a0a", outline="")
 status_item = canvas.create_text(WIN_W//2, STATUS_Y+STATUS_H//2,
     text="", fill="yellow", font=("monospace", 13), anchor="center")
 canvas.create_text(WIN_W-10, STATUS_Y+STATUS_H//2,
-    text="S=opslaan  A=thr(alles)  T=thr(actief)  ↑↓=thr±1  Shift+↑↓=±10  Tab=ROI  ESC",
+    text="S=opslaan  T=threshold(alle 3)  ↑↓=thr±1  Shift+↑↓=±10  Tab=ROI  ESC",
     fill="#444", font=("monospace", 11), anchor="e")
 
 cam0_ph=[None]; cam1_ph=[None]; graph_ph=[None]
@@ -534,8 +534,7 @@ def on_key(event):
     k = event.keysym.lower()
     if   k == "escape": root.destroy()
     elif k == "s":      save_config()
-    elif k == "t":      run_autothreshold(all_rois=False)
-    elif k == "a":      run_autothreshold(all_rois=True)
+    elif k == "t":      run_autothreshold(all_rois=True)
     elif k == "tab":
         cam1_active_roi[0] = "scr" if cam1_active_roi[0]=="led" else "led"
         status_msg[0] = f"Actieve cam1 ROI: {active_cam1_cfg()['label']}"
