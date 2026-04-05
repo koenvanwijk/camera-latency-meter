@@ -369,7 +369,7 @@ canvas.create_rectangle(0, STATUS_Y, WIN_W, WIN_H, fill="#0a0a0a", outline="")
 status_item = canvas.create_text(WIN_W//2, STATUS_Y + STATUS_H//2,
     text="", fill="yellow", font=("monospace", 13), anchor="center")
 canvas.create_text(WIN_W-10, STATUS_Y + STATUS_H//2,
-    text="R=Gemini  T=threshold  SPACE=overlay  C=calibrate  ESC=quit",
+    text="R=Gemini  T=auto-thr  ↑↓=threshold±1  Shift+↑↓=±10  SPACE=overlay  C=calib  ESC=quit",
     fill="#444", font=("monospace", 12), anchor="e")
 
 # Overlay status
@@ -453,6 +453,25 @@ def on_key(event):
     elif k == "c":      mode[0] = "calibrate"
     elif k == "r":      threading.Thread(target=run_gemini, daemon=True).start()
     elif k == "t":      run_autothreshold()
+    elif k == "up":
+        led0["thr"] = min(255, led0["thr"] + 1)
+        led1["thr"] = min(255, led1["thr"] + 1)
+        status_msg[0] = f"Threshold ↑  cam0={led0['thr']:.0f}  cam1={led1['thr']:.0f}"
+    elif k == "down":
+        led0["thr"] = max(0, led0["thr"] - 1)
+        led1["thr"] = max(0, led1["thr"] - 1)
+        status_msg[0] = f"Threshold ↓  cam0={led0['thr']:.0f}  cam1={led1['thr']:.0f}"
+    elif k == "shift_l" or k == "shift_r":
+        pass  # modifier only
+    # Shift+arrow = grote stap (10)
+    elif event.keysym == "Up" and event.state & 1:
+        led0["thr"] = min(255, led0["thr"] + 10)
+        led1["thr"] = min(255, led1["thr"] + 10)
+        status_msg[0] = f"Threshold ↑↑  cam0={led0['thr']:.0f}  cam1={led1['thr']:.0f}"
+    elif event.keysym == "Down" and event.state & 1:
+        led0["thr"] = max(0, led0["thr"] - 10)
+        led1["thr"] = max(0, led1["thr"] - 10)
+        status_msg[0] = f"Threshold ↓↓  cam0={led0['thr']:.0f}  cam1={led1['thr']:.0f}"
 
 root.bind("<Key>", on_key)
 
