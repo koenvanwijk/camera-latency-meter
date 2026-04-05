@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "camera-latency-meter"
+version = "0.1.0"
+description = "End-to-end camera pipeline latency measurement for robotics/teleop setups"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "pillow",
+    "opencv-python-headless",
+]
+
+[project.optional-dependencies]
+turbo = ["PyTurboJPEG"]  # faster JPEG decode
