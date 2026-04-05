@@ -30,7 +30,7 @@ import cv2
 parser = argparse.ArgumentParser()
 parser.add_argument("--jetson",    default="192.168.86.47")
 parser.add_argument("--cam0-port", type=int, default=5001)
-parser.add_argument("--cam1-url",  default="http://192.168.86.47:8091/stream")
+parser.add_argument("--cam1-port", type=int, default=5002)
 parser.add_argument("--win-x",     type=int, default=0)
 parser.add_argument("--win-y",     type=int, default=0)
 parser.add_argument("--auto",      action="store_true", help="Auto-threshold + measure at startup")
@@ -263,10 +263,13 @@ def cam1_loop():
     fc = 0; t0 = time.time()
     while True:
         try:
-            req = urllib.request.urlopen(args.cam1_url, timeout=10)
+            sock = socket.socket()
+            sock.connect((args.jetson, args.cam1_port))
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock.settimeout(3)
             buf = b""
             while True:
-                chunk = req.read(32768)
+                chunk = sock.recv(65536)
                 if not chunk: break
                 buf += chunk
                 while True:
@@ -297,7 +300,7 @@ def cam1_loop():
                     if fc % 30 == 0:
                         cam1_fps[0] = 30 / max(0.01, time.time()-t0)
                         t0 = time.time(); fc = 0
-            req.close()
+            sock.close()
         except: time.sleep(0.3)
 
 threading.Thread(target=cam0_loop, daemon=True).start()
@@ -503,15 +506,44 @@ def draw_triple_graph(h0, h_led, h_scr):
                   "● ON" if on_now else "○ off",
                   fill=col if on_now else (80,80,80))
 
-    # Latency annotation
+    # Latency annotation + mini histogram
     ld = lat_display
     if ld["last"] is not None:
-        txt = (f"last={ld['last']:.0f}ms  "
-               f"avg={ld['mean']:.0f}ms  "
-               f"min={ld['min']:.0f}ms  "
-               f"max={ld['max']:.0f}ms  "
-               f"n={ld['n']}")
+        txt = (f"rise: last={ld['last']:.0f}ms  "
+               f"avg={ld['mean']:.0f}±{ld['stddev']:.0f}ms  "
+               f"[{ld['min']:.0f}–{ld['max']:.0f}]  n={ld['n']}")
+        if ld["last_f"] is not None:
+            txt += f"   fall: {ld['last_f']:.0f}ms avg={ld['mean_f']:.0f}ms"
         draw.text((PAD_L, GRAPH_H-PAD_B+2), txt, fill=(255,220,60))
+
+        # Mini histogram (right side, last 100 rise samples)
+        samples = list(lat_samples)
+        if len(samples) >= 3:
+            HW, HH = 140, gh - 4   # histogram width/height
+            HX = W - PAD_R - HW - 4
+            HY = PAD_T + 2
+            draw.rectangle([HX, HY, HX+HW, HY+HH], fill=(14,14,22))
+            draw.rectangle([HX, HY, HX+HW, HY+HH], outline=(40,40,60))
+            bins = 14
+            lo, hi = min(samples), max(samples)
+            if hi > lo:
+                bw = (hi - lo) / bins
+                counts = [0] * bins
+                for v in samples:
+                    bi = min(bins-1, int((v-lo)/bw))
+                    counts[bi] += 1
+                mc = max(counts)
+                bar_w = max(1, HW // bins)
+                for bi, cnt in enumerate(counts):
+                    bh = int((cnt/mc) * (HH-14)) if mc > 0 else 0
+                    bx = HX + bi * bar_w
+                    by = HY + HH - bh - 2
+                    c = (255,200,40) if bh > 0 else (30,30,40)
+                    draw.rectangle([bx+1, by, bx+bar_w-1, HY+HH-2], fill=c)
+                # mean line
+                mx_pos = HX + int((ld['mean']-lo)/(hi-lo)*HW)
+                draw.line([(mx_pos, HY+2), (mx_pos, HY+HH-2)], fill=(100,200,255), width=1)
+            draw.text((HX+2, HY+1), f"hist n={len(samples)}", fill=(80,80,100))
     else:
         draw.text((PAD_L, GRAPH_H-PAD_B+2), "Wachten op LED1→SCR1 transitie...", fill=(80,80,80))
 
@@ -712,6 +744,6 @@ elif os.path.exists(CONFIG_FILE):
     # Config gevonden: posities laden, thresholds nog kalibreren
     root.after(500, lambda: run_autothreshold(all_rois=True))
 
-print(f"Camera Latency Meter | cam0 TCP {args.jetson}:{args.cam0_port} | cam1 {args.cam1_url}")
+print(f"Camera Latency Meter | cam0 TCP {args.jetson}:{args.cam0_port} | cam1 TCP {args.jetson}:{args.cam1_port}")
 print("S=opslaan  A=thr(alles)  T=thr(actief)  Tab=ROI  SPACE=overlay  C=calib  ESC=quit")
 root.mainloop()
