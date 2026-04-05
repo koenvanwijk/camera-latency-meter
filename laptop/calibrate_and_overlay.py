@@ -20,11 +20,11 @@ Keys:
   ESC         → afsluiten
 """
 
-import argparse, socket, time, threading, collections, statistics, json, os
+import argparse, socket, time, threading, collections, statistics, json, os, csv, datetime
 import urllib.request
 import numpy as np
 import tkinter as tk
-from PIL import Image, ImageTk, ImageDraw
+from PIL import Image, ImageTk, ImageDraw, ImageFont
 import cv2
 
 parser = argparse.ArgumentParser()
@@ -37,6 +37,7 @@ parser.add_argument("--auto",      action="store_true", help="Auto-threshold + m
 args = parser.parse_args()
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "roi_config.json")
+CSV_FILE    = os.path.join(os.path.dirname(__file__), "latency_log.csv")
 
 WIN_W, WIN_H  = 1920, 1080
 PANEL_W       = WIN_W // 2
@@ -102,18 +103,117 @@ hist1_led = collections.deque(maxlen=GRAPH_HISTORY)
 hist1_scr = collections.deque(maxlen=GRAPH_HISTORY)
 
 # ── Latency tracking ──────────────────────────────────────────────────────────
-lat_led1_rise = [None]   # timestamp of last LED1 ON-edge
-lat_scr1_rise = [None]   # timestamp of last SCR1 ON-edge
-lat_samples   = collections.deque(maxlen=20)  # last N measurements (ms)
-lat_lock      = threading.Lock()
+DEBOUNCE_MS   = 25    # ms signal must be stable before edge is accepted
+OUTLIER_SIGMA = 2.5   # samples beyond N×stddev are ignored
+
+lat_led1_rise  = [None]
+lat_led1_fall  = [None]
+lat_scr1_rise  = [None]
+lat_scr1_fall  = [None]
+
+# debounce state: (pending_state, pending_since)
+deb_led = [None, 0.0]
+deb_scr = [None, 0.0]
+
+lat_samples    = collections.deque(maxlen=100)   # rise measurements
+lat_samples_f  = collections.deque(maxlen=100)   # fall measurements
+lat_lock       = threading.Lock()
 
 lat_display = {
-    "last":  None,   # ms
-    "mean":  None,
-    "min":   None,
-    "max":   None,
-    "n":     0,
+    "last": None, "mean": None, "min": None, "max": None,
+    "stddev": None, "n": 0,
+    "last_f": None, "mean_f": None, "n_f": 0,
 }
+
+def _append_sample(samples, dt):
+    """Add dt, filter outliers, return filtered list."""
+    samples.append(dt)
+    s = list(samples)
+    if len(s) >= 4:
+        m = statistics.mean(s)
+        sd = statistics.stdev(s)
+        s_filt = [v for v in s if abs(v-m) <= OUTLIER_SIGMA*sd]
+        return s_filt if len(s_filt) >= 2 else s
+    return s
+
+def _write_csv(edge, dt):
+    new = not os.path.exists(CSV_FILE)
+    with open(CSV_FILE, "a", newline="") as f:
+        w = csv.writer(f)
+        if new:
+            w.writerow(["timestamp", "edge", "latency_ms",
+                        "cam0_fps", "cam1_fps"])
+        w.writerow([datetime.datetime.now().isoformat(), edge,
+                    f"{dt:.2f}", f"{cam0_fps[0]:.1f}", f"{cam1_fps[0]:.1f}"])
+
+def debounce(deb, new_state, t):
+    """Returns confirmed new state after DEBOUNCE_MS stable, else None."""
+    if deb[0] != new_state:
+        deb[0] = new_state
+        deb[1] = t
+        return None
+    if (t - deb[1]) * 1000 >= DEBOUNCE_MS:
+        return new_state
+    return None
+
+def update_latency(raw_led_on, raw_scr_on, t):
+    prev_led = cam1_led_on[0]
+    prev_scr = cam1_scr_on[0]
+
+    # Debounce
+    conf_led = debounce(deb_led, raw_led_on, t)
+    conf_scr = debounce(deb_scr, raw_scr_on, t)
+    new_led = conf_led if conf_led is not None else prev_led
+    new_scr = conf_scr if conf_scr is not None else prev_scr
+
+    led_rise = new_led and not prev_led
+    led_fall = not new_led and prev_led
+    scr_rise = new_scr and not prev_scr
+    scr_fall = not new_scr and prev_scr
+
+    # Rising edge: LED1 ON → SCR1 ON
+    if led_rise:
+        with lat_lock: lat_led1_rise[0] = t
+    if scr_rise and lat_led1_rise[0] is not None:
+        dt = (t - lat_led1_rise[0]) * 1000
+        if 0 < dt < 3000:
+            with lat_lock:
+                lat_led1_rise[0] = None
+                s = _append_sample(lat_samples, dt)
+                _write_csv("rise", dt)
+                lat_display["last"]   = dt
+                lat_display["mean"]   = statistics.mean(s)
+                lat_display["min"]    = min(s)
+                lat_display["max"]    = max(s)
+                lat_display["stddev"] = statistics.stdev(s) if len(s)>1 else 0
+                lat_display["n"]      = len(s)
+
+    # Falling edge: LED1 OFF → SCR1 OFF
+    if led_fall:
+        with lat_lock: lat_led1_fall[0] = t
+    if scr_fall and lat_led1_fall[0] is not None:
+        dt = (t - lat_led1_fall[0]) * 1000
+        if 0 < dt < 3000:
+            with lat_lock:
+                lat_led1_fall[0] = None
+                s = _append_sample(lat_samples_f, dt)
+                _write_csv("fall", dt)
+                lat_display["last_f"] = dt
+                lat_display["mean_f"] = statistics.mean(s)
+                lat_display["n_f"]    = len(s)
+
+    status_parts = []
+    if lat_display["last"] is not None:
+        status_parts.append(
+            f"⏱ rise={lat_display['last']:.0f}ms "
+            f"avg={lat_display['mean']:.0f}±{lat_display['stddev']:.0f}ms "
+            f"[{lat_display['min']:.0f}–{lat_display['max']:.0f}] n={lat_display['n']}")
+    if lat_display["last_f"] is not None:
+        status_parts.append(f"fall={lat_display['last_f']:.0f}ms avg={lat_display['mean_f']:.0f}ms n={lat_display['n_f']}")
+    if status_parts:
+        status_msg[0] = "  |  ".join(status_parts)
+
+    return new_led, new_scr
 
 status_msg = ["Streams verbinden..."]
 
@@ -123,33 +223,7 @@ def measure_roi(gray, cfg):
     roi = gray[max(0,cy-r):cy+r, max(0,cx-r):cx+r]
     return float(roi.mean()) if roi.size > 0 else 0.0
 
-def update_latency(new_led_on, new_scr_on, t):
-    prev_led = cam1_led_on[0]
-    prev_scr = cam1_scr_on[0]
-
-    # Detect rising edges
-    led_rise = new_led_on and not prev_led
-    scr_rise = new_scr_on and not prev_scr
-
-    if led_rise:
-        with lat_lock: lat_led1_rise[0] = t
-    if scr_rise and lat_led1_rise[0] is not None:
-        dt = (t - lat_led1_rise[0]) * 1000  # ms
-        if 0 < dt < 3000:  # sanity
-            with lat_lock:
-                lat_samples.append(dt)
-                lat_led1_rise[0] = None  # consume
-                s = list(lat_samples)
-                lat_display["last"] = dt
-                lat_display["mean"] = statistics.mean(s)
-                lat_display["min"]  = min(s)
-                lat_display["max"]  = max(s)
-                lat_display["n"]    = len(s)
-                status_msg[0] = (f"⏱ Latency: {dt:.0f}ms  "
-                                 f"avg={lat_display['mean']:.0f}ms  "
-                                 f"min={lat_display['min']:.0f}ms  "
-                                 f"max={lat_display['max']:.0f}ms  "
-                                 f"n={lat_display['n']}")
+def update_latency_OLD(): pass  # replaced — see new update_latency above
 
 def cam0_loop():
     fc = 0; t0 = time.time()
@@ -211,10 +285,10 @@ def cam1_loop():
                     new_led = vl > led1["thr"]
                     new_scr = vs > scr1["thr"]
 
-                    update_latency(new_led, new_scr, now)
+                    conf_led, conf_scr = update_latency(new_led, new_scr, now)
 
-                    cam1_led_bright[0] = vl; cam1_led_on[0] = new_led
-                    cam1_scr_bright[0] = vs; cam1_scr_on[0] = new_scr
+                    cam1_led_bright[0] = vl; cam1_led_on[0] = conf_led
+                    cam1_scr_bright[0] = vs; cam1_scr_on[0] = conf_scr
                     hist1_led.append((now, vl))
                     hist1_scr.append((now, vs))
 
@@ -256,7 +330,25 @@ def run_autothreshold(all_rois=False, on_done=None):
         if on_done: on_done()
     threading.Thread(target=_run, daemon=True).start()
 
-def auto_start_sequence():
+def save_screenshot():
+    """Composite screenshot: cam0, cam1, graph, explain panels."""
+    with cam0_lock: f0 = cam0_frame[0].copy() if cam0_frame[0] is not None else None
+    with cam1_lock: f1 = cam1_frame[0].copy() if cam1_frame[0] is not None else None
+    parts = [draw_cam0(f0), draw_cam1(f1)]
+    top = Image.new("RGB", (WIN_W, CAM_H))
+    top.paste(parts[0], (0, 0)); top.paste(parts[1], (PANEL_W, 0))
+    graph = draw_triple_graph(list(hist0), list(hist1_led), list(hist1_scr))
+    explain = draw_explain()
+    full = Image.new("RGB", (WIN_W, CAM_H + GRAPH_H + EXPLAIN_H))
+    full.paste(top, (0, 0))
+    full.paste(graph, (0, CAM_H))
+    full.paste(explain, (0, CAM_H + GRAPH_H))
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    path = os.path.join(os.path.dirname(__file__), f"screenshot_{ts}.png")
+    full.save(path)
+    status_msg[0] = f"Screenshot → {path}"
+
+
     """Wait for streams, auto-threshold all ROIs, then start measuring."""
     def _run():
         status_msg[0] = "Auto-start: wachten op streams..."
@@ -429,63 +521,61 @@ def draw_triple_graph(h0, h_led, h_scr):
 def draw_explain():
     img = Image.new("RGB", (WIN_W, EXPLAIN_H), (8, 8, 14))
     draw = ImageDraw.Draw(img)
-
     ld = lat_display
-    # Pipeline breakdown (estimated component times)
-    # Total = LED1→SCR1 flank. Components:
-    #   cam1 capture latency  ≈ 1 frame @ cam1 fps
-    #   cam0 capture latency  ≈ 1 frame @ cam0 fps
-    #   TCP stream latency    ≈ network + buffer
-    #   signal bar render     ≈ tkinter 50ms poll
-    #   cam1 MJPEG latency    ≈ 1-2 frames @ cam1 fps
 
     cam0_frame_ms = 1000/max(1, cam0_fps[0])
     cam1_frame_ms = 1000/max(1, cam1_fps[0])
 
     components = [
-        ("cam0 capture",   cam0_frame_ms,  (0, 200, 80)),
-        ("TCP stream",     None,           (80, 160, 255)),
-        ("UI render poll", 50.0,           (200, 200, 60)),
-        ("cam1 capture",   cam1_frame_ms,  (170, 90, 255)),
-        ("cam1 MJPEG",     cam1_frame_ms,  (255, 140, 30)),
+        ("cam0 capture",  cam0_frame_ms,  (0, 200, 80)),
+        ("TCP stream",    None,           (80, 160, 255)),
+        ("UI poll",       16.0,           (200, 200, 60)),
+        ("cam1 capture",  cam1_frame_ms,  (170, 90, 255)),
+        ("cam1 MJPEG",    cam1_frame_ms,  (255, 140, 30)),
     ]
     est_total = sum(v for _, v, _ in components if v is not None)
 
-    # Left: pipeline breakdown text
-    x = 10
-    draw.text((x, 6),  "Pipeline breakdown (geschat):", fill=(140,140,160), font=None)
-    x2 = 14
+    # ── Left: pipeline breakdown
+    draw.text((8, 4), "Pipeline (geschat):", fill=(130,130,150))
+    x2 = 8
     for label, val, col in components:
         val_str = f"{val:.0f}ms" if val is not None else "?"
-        draw.text((x2, 22), f"• {label:<18} {val_str}", fill=col)
-        x2 += 160
+        draw.text((x2, 18), f"• {label}", fill=col)
+        draw.text((x2, 30), f"  {val_str}", fill=tuple(int(c*0.8) for c in col))
+        x2 += 155
+    draw.text((8, 46), f"Σ geschat ≈ {est_total:.0f}ms  |  cam0:{cam0_fps[0]:.0f}fps  cam1:{cam1_fps[0]:.0f}fps",
+              fill=(160,160,80))
+    csv_n = len(lat_samples) + len(lat_samples_f)
+    draw.text((8, 60), f"CSV: {CSV_FILE}  ({csv_n} regels)", fill=(60,60,80))
 
-    draw.text((14, 42), f"Σ geschat = {est_total:.0f}ms", fill=(180,180,100))
-
-    # Middle: measured stats
+    # ── Middle: live measurements
+    MX = WIN_W//2 - 60
+    draw.line([(MX, 3), (MX, EXPLAIN_H-3)], fill=(35,35,45), width=1)
     if ld["last"] is not None:
-        mx = WIN_W//2 - 60
-        draw.line([(WIN_W//2-80, 5), (WIN_W//2-80, EXPLAIN_H-5)], fill=(40,40,50), width=1)
-        lines = [
-            (f"Gemeten latency (LED1→SCR1 flank)", (220,220,220)),
-            (f"  Laatste meting : {ld['last']:.1f} ms", (255,240,80)),
-            (f"  Gemiddelde     : {ld['mean']:.1f} ms", (100,200,255)),
-            (f"  Min / Max      : {ld['min']:.1f} / {ld['max']:.1f} ms", (160,160,200)),
-            (f"  Metingen       : {ld['n']}", (120,120,140)),
+        rows = [
+            ("RISE  laatste",  f"{ld['last']:.1f} ms",   (255,240,80)),
+            ("RISE  gem ± σ",  f"{ld['mean']:.1f} ± {ld['stddev']:.1f} ms", (100,200,255)),
+            ("RISE  min/max",  f"{ld['min']:.1f} / {ld['max']:.1f} ms",     (160,160,210)),
+            ("RISE  n (gefilterd)", f"{ld['n']}",                            (100,100,130)),
         ]
-        for i, (txt, col) in enumerate(lines):
-            draw.text((WIN_W//2-70, 4 + i*15), txt, fill=col)
+        if ld["last_f"] is not None:
+            rows.append(("FALL  laatste", f"{ld['last_f']:.1f} ms  avg={ld['mean_f']:.1f}ms  n={ld['n_f']}", (200,160,255)))
+        draw.text((MX+8, 4), "Gemeten latency:", fill=(180,180,200))
+        for i, (lbl, val, col) in enumerate(rows):
+            draw.text((MX+8,  18+i*13), lbl, fill=(120,120,140))
+            draw.text((MX+145, 18+i*13), val, fill=col)
     else:
-        draw.text((WIN_W//2-70, 20), "Nog geen meting — positioneer SCR1 op de balk", fill=(100,100,120))
+        draw.text((MX+8, 24), "Wacht op eerste meting...", fill=(80,80,100))
+        draw.text((MX+8, 40), "Positioneer SCR1 op de balk, druk T", fill=(70,70,90))
 
-    # Right: what is being measured
-    draw.line([(WIN_W*3//4, 5), (WIN_W*3//4, EXPLAIN_H-5)], fill=(40,40,50), width=1)
-    rx = WIN_W*3//4 + 10
-    draw.text((rx,  4), "Wat meet je?", fill=(160,160,180))
-    draw.text((rx, 20), "ESP32 LED knippert → cam0 detecteert flank", fill=(100,200,120))
-    draw.text((rx, 34), "→ Python zet balk WIT op scherm", fill=(200,200,200))
-    draw.text((rx, 48), "→ cam1 ziet LED (LED1) + balk (SCR1)", fill=(180,130,255))
-    draw.text((rx, 62), "→ Δt = volledige end-to-end pipeline latency", fill=(255,200,60))
+    # ── Right: what is being measured
+    RX = WIN_W*3//4
+    draw.line([(RX, 3), (RX, EXPLAIN_H-3)], fill=(35,35,45), width=1)
+    draw.text((RX+8,  4), "Wat meet je  (end-to-end):", fill=(150,150,170))
+    draw.text((RX+8, 18), "ESP32 LED ON  →  cam0 detecteert flank", fill=(80,200,100))
+    draw.text((RX+8, 31), "→  Python zet balk WIT op scherm", fill=(200,200,200))
+    draw.text((RX+8, 44), "→  cam1 ziet balk (SCR1 stijgt)", fill=(200,140,255))
+    draw.text((RX+8, 57), "→  Δt = volledige pipeline latency", fill=(255,210,60))
 
     return img
 
@@ -534,7 +624,7 @@ canvas.create_rectangle(0, STATUS_Y, WIN_W, WIN_H, fill="#0a0a0a", outline="")
 status_item = canvas.create_text(WIN_W//2, STATUS_Y+STATUS_H//2,
     text="", fill="yellow", font=("monospace", 13), anchor="center")
 canvas.create_text(WIN_W-10, STATUS_Y+STATUS_H//2,
-    text="S=opslaan  T=threshold  Tab=ROI wisselen  ESC",
+    text="S=opslaan  P=screenshot  T=threshold  Tab=ROI  ESC",
     fill="#444", font=("monospace", 11), anchor="e")
 
 cam0_ph=[None]; cam1_ph=[None]; graph_ph=[None]; explain_ph=[None]
@@ -569,7 +659,7 @@ def update():
     explain_ph[0] = ep
     canvas.itemconfig(explain_item, image=ep, state="normal")
 
-    root.after(50, update)
+    root.after(16, update)
 
 # ── Mouse ─────────────────────────────────────────────────────────────────────
 def on_click(event):
@@ -607,6 +697,7 @@ def on_key(event):
     k = event.keysym.lower()
     if   k == "escape": root.destroy()
     elif k == "s":      save_config()
+    elif k == "p":      threading.Thread(target=save_screenshot, daemon=True).start()
     elif k == "t":      run_autothreshold(all_rois=True)
     elif k == "tab":
         cam1_active_roi[0] = "scr" if cam1_active_roi[0]=="led" else "led"
