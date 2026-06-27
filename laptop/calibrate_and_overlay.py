@@ -28,21 +28,25 @@ from PIL import Image, ImageTk, ImageDraw, ImageFont
 import cv2
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--jetson",    default="192.168.86.47")
-parser.add_argument("--cam0-port", type=int, default=5001)
-parser.add_argument("--cam1-port", type=int, default=5002)
-parser.add_argument("--win-x",     type=int, default=0)
-parser.add_argument("--win-y",     type=int, default=0)
-parser.add_argument("--auto",      action="store_true", help="Auto-threshold + measure at startup")
-parser.add_argument("--session",   default="", help="Label voor deze meting (voor vergelijking)")
-parser.add_argument("--debounce",  type=int, default=25, help="Debounce ms (0=uit)")
-parser.add_argument("--ui-hz",     type=int, default=60, help="UI refresh rate Hz")
+parser.add_argument("--jetson",         default="192.168.86.47")
+parser.add_argument("--cam0-port",      type=int, default=5001)
+parser.add_argument("--cam1-port",      type=int, default=5002)
+parser.add_argument("--win-x",          type=int, default=0)
+parser.add_argument("--win-y",          type=int, default=0)
+parser.add_argument("--auto",           action="store_true", help="Auto-threshold + measure at startup")
+parser.add_argument("--session",        default="", help="Label voor deze meting (voor vergelijking)")
+parser.add_argument("--debounce",       type=int, default=25, help="Debounce ms (0=uit)")
+parser.add_argument("--ui-hz",          type=int, default=60, help="UI refresh rate Hz")
+parser.add_argument("--usb-cam1",       type=int, default=-1,   help="Lokale USB cam1 device index (bijv. 0); -1=uit")
+parser.add_argument("--usb-cam1-width", type=int, default=1280, help="USB cam1 breedte")
+parser.add_argument("--usb-cam1-height",type=int, default=720,  help="USB cam1 hoogte")
+parser.add_argument("--usb-cam1-fps",   type=int, default=60,   help="USB cam1 gewenste FPS")
 args = parser.parse_args()
 
 CONFIG_FILE = os.path.join(os.path.dirname(__file__), "roi_config.json")
 CSV_FILE    = os.path.join(os.path.dirname(__file__), "latency_log.csv")
 
-# ── Feature switches (live toggleable via keys 1-5) ───────────────────────────
+# ── Feature switches (live toggleable via keys 1-7) ───────────────────────────
 features = {
     "debounce":  True,   # 1 — debounce flanken (25ms stabiel vereist)
     "outlier":   True,   # 2 — outlier filter (2.5×σ)
@@ -50,6 +54,7 @@ features = {
     "ui_60hz":   True,   # 4 — UI 60Hz (False = 20Hz)
     "csv":       True,   # 5 — CSV schrijven aan/uit
     "udp_mode":  False,  # 6 — UDP brightness mode (Jetson berekent ROIs zelf)
+    "usb_cam1":  False,  # 7 — cam1 via lokale USB camera (Logitech) i.p.v. Jetson stream
 }
 
 FEATURE_KEYS = {
@@ -59,14 +64,19 @@ FEATURE_KEYS = {
     "4": "ui_60hz",
     "5": "csv",
     "6": "udp_mode",
+    "7": "usb_cam1",
 }
+
+if args.usb_cam1 >= 0:
+    features["usb_cam1"] = True
 
 def features_tag():
     """Genereer session tag op basis van actieve features."""
     parts = []
     if features["debounce"]:  parts.append("deb")
     if features["outlier"]:   parts.append("filt")
-    if features["udp_mode"]:  parts.append("udp")
+    if features["usb_cam1"]:  parts.append("usb1")
+    elif features["udp_mode"]: parts.append("udp")
     elif features["tcp_cam1"]: parts.append("tcp1")
     if features["ui_60hz"]:   parts.append("60hz")
     return "-".join(parts) if parts else "bare"
@@ -321,58 +331,93 @@ def cam0_loop():
             sock.close()
         except: time.sleep(0.3)
 
+def _cam1_process_frame(arr, fc_ref, t0_ref):
+    gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+    now  = time.time()
+    vl = measure_roi(gray, led1)
+    vs = measure_roi(gray, scr1)
+    conf_led, conf_scr = update_latency(vl > led1["thr"], vs > scr1["thr"], now)
+    cam1_led_bright[0] = vl; cam1_led_on[0] = conf_led
+    cam1_scr_bright[0] = vs; cam1_scr_on[0] = conf_scr
+    hist1_led.append((now, vl))
+    hist1_scr.append((now, vs))
+    with cam1_lock: cam1_frame[0] = arr
+    fc_ref[0] += 1
+    if fc_ref[0] % 30 == 0:
+        cam1_fps[0] = 30 / max(0.01, time.time() - t0_ref[0])
+        t0_ref[0] = time.time()
+        fc_ref[0] = 0
+
 def cam1_loop():
-    fc = 0; t0 = time.time()
+    fc = [0]; t0 = [time.time()]
     while True:
         try:
-            if features["tcp_cam1"]:
+            if features["usb_cam1"]:
+                # ── Lokale USB camera (Logitech) — geen netwerk-hop ──────────
+                dev = args.usb_cam1 if args.usb_cam1 >= 0 else 0
+                cap = cv2.VideoCapture(dev, cv2.CAP_V4L2)
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH,  args.usb_cam1_width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.usb_cam1_height)
+                cap.set(cv2.CAP_PROP_FPS,          args.usb_cam1_fps)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # keep only latest frame
+                if not cap.isOpened():
+                    status_msg[0] = f"USB cam1: /dev/video{dev} niet gevonden"
+                    time.sleep(1); continue
+                actual_fps = cap.get(cv2.CAP_PROP_FPS)
+                actual_w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+                actual_h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                status_msg[0] = (f"USB cam1 /dev/video{dev}: "
+                                 f"{actual_w}×{actual_h} @ {actual_fps:.0f}fps")
+                while features["usb_cam1"]:
+                    ret, arr = cap.read()
+                    if not ret: break
+                    _cam1_process_frame(arr, fc, t0)
+                cap.release()
+
+            elif features["tcp_cam1"]:
                 sock = socket.socket()
                 sock.connect((args.jetson, args.cam1_port))
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 sock.settimeout(3)
                 buf = b""
-                def _read():
-                    return sock.recv(65536)
+                def _read(): return sock.recv(65536)
                 def _close(): sock.close()
+                while not features["usb_cam1"]:
+                    chunk = _read()
+                    if not chunk: break
+                    buf += chunk
+                    while True:
+                        s = buf.find(b"\xff\xd8")
+                        if s == -1: buf = b""; break
+                        e = buf.find(b"\xff\xd9", s+2)
+                        if e == -1: buf = buf[s:]; break
+                        frame = buf[s:e+2]; buf = buf[e+2:]
+                        arr = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_COLOR)
+                        if arr is not None:
+                            _cam1_process_frame(arr, fc, t0)
+                _close()
+
             else:
                 req = urllib.request.urlopen(f"http://{args.jetson}:8091/stream", timeout=10)
                 buf = b""
                 def _read(): return req.read(32768)
                 def _close(): req.close()
+                while not features["usb_cam1"]:
+                    chunk = _read()
+                    if not chunk: break
+                    buf += chunk
+                    while True:
+                        s = buf.find(b"\xff\xd8")
+                        if s == -1: buf = b""; break
+                        e = buf.find(b"\xff\xd9", s+2)
+                        if e == -1: buf = buf[s:]; break
+                        frame = buf[s:e+2]; buf = buf[e+2:]
+                        arr = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_COLOR)
+                        if arr is not None:
+                            _cam1_process_frame(arr, fc, t0)
+                _close()
 
-            while True:
-                chunk = _read()
-                if not chunk: break
-                buf += chunk
-                while True:
-                    s = buf.find(b"\xff\xd8")
-                    if s == -1: buf = b""; break
-                    e = buf.find(b"\xff\xd9", s+2)
-                    if e == -1: buf = buf[s:]; break
-                    frame = buf[s:e+2]; buf = buf[e+2:]
-                    arr = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_COLOR)
-                    if arr is None: continue
-                    gray = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
-                    now = time.time()
-
-                    vl = measure_roi(gray, led1)
-                    vs = measure_roi(gray, scr1)
-                    new_led = vl > led1["thr"]
-                    new_scr = vs > scr1["thr"]
-
-                    conf_led, conf_scr = update_latency(new_led, new_scr, now)
-
-                    cam1_led_bright[0] = vl; cam1_led_on[0] = conf_led
-                    cam1_scr_bright[0] = vs; cam1_scr_on[0] = conf_scr
-                    hist1_led.append((now, vl))
-                    hist1_scr.append((now, vs))
-
-                    with cam1_lock: cam1_frame[0] = arr
-                    fc += 1
-                    if fc % 30 == 0:
-                        cam1_fps[0] = 30 / max(0.01, time.time()-t0)
-                        t0 = time.time(); fc = 0
-            _close()
         except: time.sleep(0.3)
 
 threading.Thread(target=cam0_loop, daemon=True).start()
@@ -776,7 +821,7 @@ status_item = canvas.create_text(WIN_W//2, STATUS_Y+STATUS_H//2,
     text="", fill="yellow", font=("monospace", 13), anchor="center")
 canvas.create_text(WIN_W-10, STATUS_Y+STATUS_H//2,
     text="S=opslaan  P=screenshot  T=threshold  Tab=ROI  "
-         "1=debounce  2=outlier  3=tcp_cam1  4=ui_60hz  5=csv  ESC",
+         "1=debounce  2=outlier  3=tcp_cam1  4=ui_60hz  5=csv  6=udp  7=usb_cam1  ESC",
     fill="#444", font=("monospace", 11), anchor="e")
 
 cam0_ph=[None]; cam1_ph=[None]; graph_ph=[None]; explain_ph=[None]
@@ -871,6 +916,8 @@ elif os.path.exists(CONFIG_FILE):
     # Config gevonden: posities laden, thresholds nog kalibreren
     root.after(500, lambda: run_autothreshold(all_rois=True))
 
-print(f"Camera Latency Meter | cam0 TCP {args.jetson}:{args.cam0_port} | cam1 TCP {args.jetson}:{args.cam1_port}")
+_cam1_src = (f"USB /dev/video{args.usb_cam1} {args.usb_cam1_width}×{args.usb_cam1_height}@{args.usb_cam1_fps}fps"
+             if args.usb_cam1 >= 0 else f"Jetson TCP {args.jetson}:{args.cam1_port}")
+print(f"Camera Latency Meter | cam0 TCP {args.jetson}:{args.cam0_port} | cam1 {_cam1_src}")
 print("S=opslaan  A=thr(alles)  T=thr(actief)  Tab=ROI  SPACE=overlay  C=calib  ESC=quit")
 root.mainloop()
