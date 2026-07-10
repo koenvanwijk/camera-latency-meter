@@ -3,7 +3,7 @@
 Overzicht van commerciële en open-source teleoperation platformen, hun transport-keuzes
 en wat dit betekent voor latency-optimalisatie.
 
-Bronnen: Adamo blog, LiveKit Portal GitHub, Transitive transAct GitHub, websitescans (juli 2026).
+Bronnen: Adamo blog, LiveKit Portal GitHub, Transitive transAct GitHub, Kyber/SVTA, websitescans (juli 2026).
 
 ---
 
@@ -11,6 +11,7 @@ Bronnen: Adamo blog, LiveKit Portal GitHub, Transitive transAct GitHub, websites
 
 | Platform | Transport | Latency clean | Latency 10% loss | Prijs | Focus |
 |---|---|---|---|---|---|
+| [Kyber](https://jbkempf.com/) | QUIC + RaptorQ FEC (open source) | **8ms** (doel: 4ms) | onbekend | Open source + commercial | Robotica, drones, defensie |
 | [Adamo](https://adamohq.com/) | Custom QUIC (geen WebRTC) | ~40ms | 133ms | €50/robot/mnd | Professionele teleop |
 | [LiveKit Portal](https://github.com/livekit/portal) | WebRTC SFU + Rust layer | ~100ms | 183ms | Usage-based | Data collectie + AI inference |
 | [Transitive](https://github.com/transitiverobotics/transact) | WebRTC (open source) | ~100ms | 617ms → drop | Subscription | Fleet management dashboard |
@@ -88,13 +89,58 @@ SOC 2 compliant, end-to-end encryptie.
 
 ---
 
+### Kyber — QUIC + RaptorQ, gebouwd door de VLC-maker
+
+Jean-Baptiste Kempf (oprichter van VideoLAN/VLC, 6 miljard downloads) bouwt Kyber als
+open-source SDK voor realtime machine-besturing. Raised $5M seed (Lightspeed, juni 2026).
+
+**Technische aanpak:**
+
+- **Transport**: QUIC + WebTransport — video, audio, sensoren én control inputs in
+  één enkele socket gemultiplexed. Geen aparte TCP-verbinding voor control naast UDP voor video.
+- **Stack**: FFmpeg als server (omgeschreven naar push-mode), VLC als decoder (omgeschreven
+  naar realtime-mode). Volledig op bestaande, bewezen open-source media-libraries.
+- **FEC**: RaptorQ (Raptor codes) — dezelfde techniek die Ottopia industrieel toepast.
+  Verloren pakketjes worden aan de ontvangerzijde gereconstrueerd uit redundante data,
+  zonder retransmissie-round-trip.
+- **Latency**: 8ms glass-to-glass gedemonstreerd (Mile High Video, februari 2025).
+  Doel: 4ms.
+- **Geen jitter buffer**: net als Adamo — altijd de nieuwste frame, geen smoothing.
+
+**Waarom relevant:**
+
+Kyber is het enige platform dat QUIC + RaptorQ combineert én open source is.
+Adamo doet hetzelfde maar is gesloten en kost €50/robot/mnd.
+Kyber biedt dezelfde architectuur als zelfbouwoptie.
+
+**Vergelijking Kyber vs. Adamo:**
+
+| | Kyber | Adamo |
+|---|---|---|
+| Transport | QUIC + WebTransport | Custom QUIC |
+| FEC | RaptorQ (open) | Onbekend |
+| Video stack | FFmpeg + VLC | Proprietary |
+| Open source | Ja | Nee |
+| Prijs | Gratis (SDK) | €50/robot/mnd |
+| Latency (clean) | 8ms (doel 4ms) | ~40ms |
+
+Het latency-verschil (8ms vs 40ms) komt waarschijnlijk uit de encode-pipeline:
+Kyber is diep in FFmpeg geïntegreerd en kan hardware-encoders (NVENC, VA-API) direct
+aansturen zonder onnodige buffer-stappen. Adamo's stack is onbekend maar waarschijnlijk
+minder geoptimaliseerd op encode-latency.
+
+**Referentie**: [SVTA conference: Kyber — QUIC approach for real-time video and controls](https://university.svta.org/conference-proceedin/kyber-a-new-approach-for-real-time-video-and-controls-streaming-based-on-quic/)
+
+---
+
 ## Transport hiërarchie voor lossy netwerken
 
 ```
 Laagste latency onder packet loss:
-  FEC over UDP    (Ottopia)              ← geen retransmissie, geen gaten
-  Custom QUIC     (Adamo)               ← geen HoL-blocking, geen jitter buffer
-  Plain UDP       (onze UDP mode)       ← gooi verloren frames weg
+  QUIC + RaptorQ  (Kyber)               ← geen retransmissie, geen gaten, 8ms
+  FEC over UDP    (Ottopia)             ← geen retransmissie, geen gaten
+  Custom QUIC     (Adamo)              ← geen HoL-blocking, geen jitter buffer, ~40ms
+  Plain UDP       (onze UDP mode)      ← gooi verloren frames weg
   WebRTC          (LiveKit, Transitive, AY-Robots)  ← jitter buffer = verborgen delay
   TCP             (onze cam0/cam1 stream)  ← retransmissie = spikes bij loss
 Hoogste latency onder packet loss
@@ -141,11 +187,16 @@ python laptop/compare_sessions.py
 
 ### Volgende optimalisatie-stap
 
-Op basis van deze vergelijking is **FEC over UDP** de grootste sprong die nog te maken is:
+Op basis van deze vergelijking is **QUIC + RaptorQ FEC** de grootste sprong die nog te maken is —
+dit is exact de architectuur die Kyber open source beschikbaar stelt:
+
 - Geen retransmissie-spikes zoals TCP
 - Geen gaten in het signaal zoals plain UDP
-- Python libraries: `zfec`, `raptorq` (Reed-Solomon / Raptor codes)
-- Implementatie: zender stuurt N + K pakketjes, ontvanger reconstrueert frame uit
-  willekeurige N van de N + K ontvangen pakketjes
+- RaptorQ: zender stuurt N + K pakketjes, ontvanger reconstrueert frame uit
+  willekeurige N van de N + K ontvangen pakketjes (zonder retransmissie-round-trip)
+- Python libraries: `raptorq` (Rust-based, snel), `zfec` (Reed-Solomon, eenvoudiger)
 
-Dit is de aanpak die Ottopia industrieel toepast en die in latency tussen QUIC en plain UDP zit.
+Kyber is de open-source referentie-implementatie van deze aanpak, gebouwd op FFmpeg + VLC.
+Adamo doet hetzelfde maar is gesloten. Ottopia doet FEC over UDP (zonder QUIC).
+
+**Kyber SDK**: https://jbkempf.com/ — volg de repository voor integratie-mogelijkheden.
