@@ -1,202 +1,227 @@
-# Teleoperation Platform Vergelijking
+# Teleoperation Platform Marktkaart
 
-Overzicht van commerciële en open-source teleoperation platformen, hun transport-keuzes
-en wat dit betekent voor latency-optimalisatie.
+Marktindeling en technische vergelijking van teleoperation platformen, transport-keuzes,
+en een concreet testplan om Kyber en Adamo te reproduceren op onze Jetson Orin setup.
 
-Bronnen: Adamo blog, LiveKit Portal GitHub, Transitive transAct GitHub, Kyber/SVTA, websitescans (juli 2026).
+Bronnen: Adamo blog, LiveKit Portal GitHub, Transitive transAct GitHub,
+RidgeRun developer wiki, IETF MoQ datatracker, websitescans (juli 2026).
 
 ---
 
-## Platform vergelijking
+## Marktindeling
 
-| Platform | Transport | Latency clean | Latency 10% loss | Prijs | Focus |
+### 1. Complete platforms
+
+Kant-en-klare teleoperation diensten inclusief infrastructuur, monitoring en support.
+
+| Platform | Transport | Latency clean | Latency 10% loss | Prijs | Open? |
 |---|---|---|---|---|---|
-| [Kyber](https://jbkempf.com/) | QUIC + RaptorQ FEC (open source) | **8ms** (doel: 4ms) | onbekend | Open source + commercial | Robotica, drones, defensie |
-| [Adamo](https://adamohq.com/) | Custom QUIC (geen WebRTC) | ~40ms | 133ms | €50/robot/mnd | Professionele teleop |
-| [LiveKit Portal](https://github.com/livekit/portal) | WebRTC SFU + Rust layer | ~100ms | 183ms | Usage-based | Data collectie + AI inference |
-| [Transitive](https://github.com/transitiverobotics/transact) | WebRTC (open source) | ~100ms | 617ms → drop | Subscription | Fleet management dashboard |
-| [AY-Robots](https://ay-robots.com/) | WebRTC | ~100ms | ~400ms+ | €50/robot/mnd | AI training data collectie |
-| [Ottopia](https://www.ottopia.tech/) | Proprietary + FEC | "ultra-low" | onbekend | Enterprise | Militair / autonome voertuigen |
-| [Avear Robotics](https://www.avearobotics.com/) | Onbekend | Claimt 10ms | onbekend | Onbekend | Nieuw (2024), haptics, 6× HD |
+| [Adamo](https://adamohq.com/) | Custom QUIC, geen jitter buffer | ~40ms | 133ms | €50/robot/mnd | Nee |
+| [LiveKit Portal](https://github.com/livekit/portal) | WebRTC SFU + Rust/Python laag | ~100ms | 183ms | Usage-based | Ja (portal laag) |
+| [AY-Robots](https://ay-robots.com/) | WebRTC (niet transparant) | ~100ms | ~400ms+ | €50/robot/mnd | Nee |
+
+**Noot AY-Robots:** transportkeuze niet publiek gedocumenteerd; bij twijfel WebRTC aannemen.
 
 ---
 
-## Kernlessen per platform
+### 2. QUIC/MoQ SDK's
 
-### Adamo — custom QUIC, sub-40ms
+Bouwblokken voor zelf implementeren — open source, geen managed infrastructure.
 
-Sub-40ms glass-to-glass door drie keuzes gecombineerd:
+#### [Kyber](https://jbkempf.com/) — QUIC + RaptorQ, gebouwd door de VLC-maker
 
-1. **QUIC in plaats van WebRTC** — geen head-of-line blocking per stream; controle-pakketjes
-   hebben hogere prioriteit dan video
-2. **Geen jitter buffer** — altijd de nieuwste frame, ook als er frames zijn gemist;
-   vloeiendheid is bewust opgeofferd voor lagere latency
-3. **Multi-path bonding** — LTE + 5G + WiFi tegelijk voor redundantie onder packet loss
+Jean-Baptiste Kempf (oprichter VideoLAN/VLC, 6 miljard downloads).
+$5M seed Lightspeed, juni 2026. Hubs in Parijs, San Francisco, Singapore.
 
-Benchmark (Adamo blog, zelfde camera door alle drie tegelijk):
+- **Transport:** QUIC + WebTransport — video, audio, sensoren én control in één socket
+- **Stack:** FFmpeg (server, push-mode) + VLC (decoder, realtime-mode)
+- **FEC:** RaptorQ — verloren pakketjes gereconstrueerd zonder retransmissie-round-trip
+- **Latency:** 8ms glass-to-glass gedemonstreerd (Mile High Video, feb 2025); doel 4ms
+- **Geen jitter buffer:** altijd de nieuwste frame, geen smoothing
+- **Open source:** ja
+- **Sterk punt voor ons:** FFmpeg en GStreamer delen dezelfde codec-backends (NVENC op Jetson);
+  Kyber's encode-pipeline is direct porteerbaar naar Jetson Orin
 
-```
-Packet loss    Adamo    LiveKit    Transitive
-0%             ~83ms    ~100ms     ~100ms
-10%            133ms    183ms      617ms
-15%            ~180ms   ~220ms     stream dropped
-```
+#### Quicwire
 
-### LiveKit Portal — WebRTC + gesynchroniseerde observaties
+Beperkte publieke informatie gevonden. Vermeld als QUIC/MoQ SDK voor teleoperation,
+maar geen publieke repository of website beschikbaar op moment van schrijven (juli 2026).
+*Nader onderzoeken zodra meer publiek beschikbaar is.*
 
-Open source Rust/Python laag bovenop WebRTC SFU.
-Interessant: elke frame én elk control-pakket krijgt een monotone klok-timestamp,
-dan worden camera + joint state + timestamp gebundeld in één "observation" per tick.
-Dit is precies de meting die de camera-latency-meter ook doet — validatie van de aanpak.
+#### [RidgeRun GstMoQ](https://developer.ridgerun.com/wiki/index.php/RidgeRun_Media_Over_Quic_GStreamer_Plugin_GstMoQ)
 
-SCTP data channels: per stream instelbaar als reliable of unreliable.
-Voor control: unreliable (gooi oude commando's weg). Voor configuratie: reliable.
+GStreamer plugin voor Media over QUIC — native Jetson integratie.
 
-### Transitive — open source referentie
-
-`transAct` is een fork-and-customize fleet dashboard (React + ShadCn + Tailwind).
-WebRTC als transport → zelfde kwetsbaarheid als LiveKit onder packet loss.
-Waarde: je kunt de broncode bestuderen voor fleet management UI patronen.
-
-### Ottopia — FEC in plaats van retransmissie
-
-Ottopia gebruikt Forward Error Correction in plaats van TCP-retransmissie:
-
-```
-TCP:       verlies → wacht op retransmissie → spike (50–200ms extra)
-Plain UDP: verlies → frame weg → gat in signaal
-FEC UDP:   verlies → receiver reconstrueert uit redundante data → geen spike, geen gat
-```
-
-Extra: AI-gebaseerde super-resolutie reduceert bandbreedte met 20% zonder kwaliteitsverlies.
-Focus op militaire en AV-markt; enterprise pricing.
-
-### Avear Robotics — 10ms claim (lokaal)
-
-Glass-to-glass over een netwerk is fysisch niet minder dan ~RTT/2 + encode + decode.
-10ms is alleen haalbaar zonder netwerk: lokale USB camera rechtstreeks op de laptop.
-Dit is precies wat `--usb-cam1` (Feature 7) doet — architectureel gelijk aan Avear's aanpak.
-
-Ondersteunt tot 6 gelijktijdige HD-streams + haptic feedback.
-Eerste commerciële deal: maart 2026. Nog vroeg stadium.
-
-### AY-Robots — data collectie focus
-
-Zelfde prijs als Adamo (€50/robot/mnd), maar WebRTC-transport.
-Primaire use case: AI training data verzamelen, niet real-time teleoperatie.
-Ondersteunt SO-100, Franka, ALOHA en andere populaire robot arms.
-SOC 2 compliant, end-to-end encryptie.
+- **Transport:** MoQ over QUIC (IETF draft)
+- **Stack:** GStreamer elementen (`rrmoqbin`, `rrmoqsrc`, `rrmoqsink`) — drop-in naast nvarguscamerasrc
+- **Jetson:** gedocumenteerd op Jetson AGX Orin, inclusief NVENC zero-latency tuning
+- **Meerdere tracks:** meerdere videotracks in één MoQ sessie (360° video demo met Meta Quest 2)
+- **SEI metadata:** `GstSEI` plugin voor tijdstempels en custom metadata per frame
+- **Open source:** deels (plugin is commercieel bij RidgeRun, referentie-implementatie beschikbaar)
+- **Sterk punt voor ons:** onze GStreamer pipeline (`nvarguscamerasrc → nvjpegenc → tcpserversink`)
+  is één-op-één te vervangen door `nvarguscamerasrc → nvh264enc → rrmoqsink`
 
 ---
 
-### Kyber — QUIC + RaptorQ, gebouwd door de VLC-maker
+### 3. QUIC/MoQ infrastructuur
 
-Jean-Baptiste Kempf (oprichter van VideoLAN/VLC, 6 miljard downloads) bouwt Kyber als
-open-source SDK voor realtime machine-besturing. Raised $5M seed (Lightspeed, juni 2026).
+Relay-netwerken en protocoldefinities — geen volledige SDK, wel bouwstenen.
 
-**Technische aanpak:**
+#### [moq.dev](https://doc.moq.dev/) — open source MoQ reference implementatie
 
-- **Transport**: QUIC + WebTransport — video, audio, sensoren én control inputs in
-  één enkele socket gemultiplexed. Geen aparte TCP-verbinding voor control naast UDP voor video.
-- **Stack**: FFmpeg als server (omgeschreven naar push-mode), VLC als decoder (omgeschreven
-  naar realtime-mode). Volledig op bestaande, bewezen open-source media-libraries.
-- **FEC**: RaptorQ (Raptor codes) — dezelfde techniek die Ottopia industrieel toepast.
-  Verloren pakketjes worden aan de ontvangerzijde gereconstrueerd uit redundante data,
-  zonder retransmissie-round-trip.
-- **Latency**: 8ms glass-to-glass gedemonstreerd (Mile High Video, februari 2025).
-  Doel: 4ms.
-- **Geen jitter buffer**: net als Adamo — altijd de nieuwste frame, geen smoothing.
+- Rust (native) + TypeScript (web) implementatie van IETF draft-ietf-moq-transport
+- Draft versie 17 (maart 2026); RFC verwacht 2027–2028
+- Control messages: SUBSCRIBE, ANNOUNCE, PUBLISH, FETCH, UNSUBSCRIBE
+- Data model: tracks → groups → subgroups → objects
+- GStreamer plugin beschikbaar (zie `doc.moq.dev/app/gstreamer`)
+- 11 vendors demonstreerden interoperabiliteit op NAB Show 2026 (Cloudflare, AWS, Bitmovin, ...)
 
-**Waarom relevant:**
+#### [Cloudflare MoQ](https://blog.cloudflare.com/) relay
 
-Kyber is het enige platform dat QUIC + RaptorQ combineert én open source is.
-Adamo doet hetzelfde maar is gesloten en kost €50/robot/mnd.
-Kyber biedt dezelfde architectuur als zelfbouwoptie.
-
-**Vergelijking Kyber vs. Adamo:**
-
-| | Kyber | Adamo |
-|---|---|---|
-| Transport | QUIC + WebTransport | Custom QUIC |
-| FEC | RaptorQ (open) | Onbekend |
-| Video stack | FFmpeg + VLC | Proprietary |
-| Open source | Ja | Nee |
-| Prijs | Gratis (SDK) | €50/robot/mnd |
-| Latency (clean) | 8ms (doel 4ms) | ~40ms |
-
-Het latency-verschil (8ms vs 40ms) komt waarschijnlijk uit de encode-pipeline:
-Kyber is diep in FFmpeg geïntegreerd en kan hardware-encoders (NVENC, VA-API) direct
-aansturen zonder onnodige buffer-stappen. Adamo's stack is onbekend maar waarschijnlijk
-minder geoptimaliseerd op encode-latency.
-
-**Referentie**: [SVTA conference: Kyber — QUIC approach for real-time video and controls](https://university.svta.org/conference-proceedin/kyber-a-new-approach-for-real-time-video-and-controls-streaming-based-on-quic/)
+- Cloudflare heeft een globaal MoQ relay-netwerk uitgerold
+- Actieve bijdrager aan IETF MoQ specificatie
+- Relevant als infrastructuurlaag voor Adamo-alternatief op internet
 
 ---
 
-## Transport hiërarchie voor lossy netwerken
+### 4. Generieke QUIC libraries
 
-```
-Laagste latency onder packet loss:
-  QUIC + RaptorQ  (Kyber)               ← geen retransmissie, geen gaten, 8ms
-  FEC over UDP    (Ottopia)             ← geen retransmissie, geen gaten
-  Custom QUIC     (Adamo)              ← geen HoL-blocking, geen jitter buffer, ~40ms
-  Plain UDP       (onze UDP mode)      ← gooi verloren frames weg
-  WebRTC          (LiveKit, Transitive, AY-Robots)  ← jitter buffer = verborgen delay
-  TCP             (onze cam0/cam1 stream)  ← retransmissie = spikes bij loss
-Hoogste latency onder packet loss
-```
+Laagste niveau — protocol implementaties zonder media-laag.
+
+| Library | Taal | Onderhoud | Gebruik |
+|---|---|---|---|
+| [quiche](https://github.com/cloudflare/quiche) | Rust + C bindings | Cloudflare | Productie, ook in curl |
+| [quinn](https://github.com/quinn-rs/quinn) | Pure Rust | Community | Gebruikt door moq.dev |
+| [msquic](https://github.com/microsoft/msquic) | C (cross-platform) | Microsoft | Windows + Linux embedded |
+| [aioquic](https://github.com/aiortc/aioquic) | Python async | Community | Prototyping, niet voor productie |
+
+Voor onze use case: **aioquic** om snel te experimenteren op laptop-side;
+**quiche** of **quinn** als we naar productie-kwaliteit willen op Jetson.
 
 ---
 
-## Wat dit betekent voor deze meter
+## Marktconclusie
 
-### Huidige architectuur vs. commerciële platformen
+> De markt bestaat op dit moment vooral uit **Adamo als product** en
+> **Kyber/RidgeRun GstMoQ als opkomende technologie**.
+> Er is geen duidelijk publiek, kant-en-klaar QUIC-robotteleopplatform anders dan Adamo.
 
-| Component | Onze meter | Commercieel equivalent |
-|---|---|---|
-| cam0 (TCP, Jetson) | Basis TCP stream | Transitive / AY-Robots niveau |
-| cam1 UDP brightness | Plain UDP, geen video | Richting Adamo (geen jitter buffer) |
-| cam1 USB lokaal | Geen netwerk | Avear niveau (10ms mogelijk) |
+Vermoedelijk ontbreekt nog: Quicwire (beperkte info), en elk platform dat
+MoQ + robotica-control combineert in een managed service op Adamo-niveau.
 
-### Vergelijkbare meting zelf uitvoeren
+---
 
-Dezelfde benchmark als de Adamo blog, maar op eigen hardware en met hardware-bewijs:
+## Drie concrete tests voor Teleopworks
+
+Eerlijke vergelijking: kopen vs. open-source integreren vs. zelf de transportlaag bouwen.
+
+### Test 1 — Adamo als managed referentie
+
+- Doel: hardware-gemeten baseline van het beste commerciële product
+- Aanpak: Adamo trial account, hun agent op de Jetson Orin, onze camera-latency-meter
+  meet de echte glass-to-glass latency (niet hun marketingcijfer)
+- Sessie-labels: `adamo_clean`, `adamo_5loss`, `adamo_10loss`
+- Meetbaar met: `calibrate_and_overlay.py` — geen aanpassing nodig
+
+### Test 2 — Quicwire als open MoQ experiment
+
+- Doel: open MoQ protocol testen zodra Quicwire publiek beschikbaar is
+- Aanpak: Quicwire SDK op Jetson + laptop, zelfde camera-setup
+- Alternatief nu: moq.dev GStreamer plugin als tussenoplossing
+- Sessie-labels: `moq_clean`, `moq_5loss`
+
+### Test 3 — RidgeRun GstMoQ of Kyber als native Jetson/GStreamer route
+
+Twee sub-varianten, start met RidgeRun (laagste integratiedrempel):
+
+**3a. RidgeRun GstMoQ** (GStreamer drop-in):
+```bash
+# Huidige pipeline op Jetson (start_cam0_tcp.sh):
+nvarguscamerasrc → nvjpegenc → tcpserversink
+
+# Vervangen door:
+nvarguscamerasrc → nvh264enc (zerolatency) → rrmoqsink
+```
+Laptop-side: `rrmoqsrc` → decode → brightness meting (zelfde Python logica)
+
+**3b. Kyber** (FFmpeg-based):
+```bash
+# Jetson: Kyber server streamt cam0 via QUIC
+kyber-server --device /dev/video0 --port 5001
+
+# Laptop: Kyber client → frame → numpy → ROI meting
+kyber-client --host 192.168.86.47 --port 5001 | python cam0_loop.py
+```
+Sessie-labels: `ridgerun_clean`, `kyber_clean`, `kyber_5loss`, `kyber_10loss`
+
+### Vergelijking draaien
 
 ```bash
-# Sessie 1: TCP cam1 (baseline)
-python laptop/calibrate_and_overlay.py --session tcp_clean
-
-# Sessie 2: USB cam1 (geen netwerk-hop)
-python laptop/calibrate_and_overlay.py --usb-cam1 0 --session usb_clean
-
-# Sessie 3: UDP brightness mode
-# Start met Feature 6 aan
-python laptop/calibrate_and_overlay.py --session udp_clean
-
-# Herhaal met packet loss via tc netem op de Jetson-interface:
-sudo tc qdisc add dev eth0 root netem loss 5%
-# → sessies met _5loss suffix
-
-sudo tc qdisc change dev eth0 root netem loss 10%
-# → sessies met _10loss suffix
-
-sudo tc qdisc del dev eth0 root   # achteraf opruimen
-
+# Na alle sessies:
 python laptop/compare_sessions.py
+
+# Verwachte volgorde (beste → slechtste onder 10% loss):
+# kyber_10loss < ridgerun_10loss < adamo_10loss < moq_10loss < tcp_10loss
 ```
 
-### Volgende optimalisatie-stap
+---
 
-Op basis van deze vergelijking is **QUIC + RaptorQ FEC** de grootste sprong die nog te maken is —
-dit is exact de architectuur die Kyber open source beschikbaar stelt:
+## Transporthiërarchie (van laag naar hoog onder packet loss)
 
-- Geen retransmissie-spikes zoals TCP
-- Geen gaten in het signaal zoals plain UDP
-- RaptorQ: zender stuurt N + K pakketjes, ontvanger reconstrueert frame uit
-  willekeurige N van de N + K ontvangen pakketjes (zonder retransmissie-round-trip)
-- Python libraries: `raptorq` (Rust-based, snel), `zfec` (Reed-Solomon, eenvoudiger)
+```
+QUIC + RaptorQ FEC   (Kyber)                  8ms clean,  doel 4ms
+QUIC + MoQ           (RidgeRun GstMoQ, moq.dev)  ~20-40ms geschat
+Custom QUIC          (Adamo)                  ~40ms clean, 133ms @ 10% loss
+Plain UDP            (onze UDP brightness mode)  snel, maar gaten bij loss
+FEC over UDP         (Ottopia, proprietary)    geen gaten, geen retransmissie
+WebRTC               (LiveKit, Transitive, AY-Robots)  100ms+, 183-617ms @ 10%
+TCP                  (onze cam0/cam1 baseline)  100ms+, spikes bij loss
+```
 
-Kyber is de open-source referentie-implementatie van deze aanpak, gebouwd op FFmpeg + VLC.
-Adamo doet hetzelfde maar is gesloten. Ottopia doet FEC over UDP (zonder QUIC).
+---
 
-**Kyber SDK**: https://jbkempf.com/ — volg de repository voor integratie-mogelijkheden.
+## Appendix: platformdetails
+
+### Adamo
+
+Sub-40ms door drie keuzes:
+1. QUIC zonder WebRTC → geen head-of-line blocking
+2. Geen jitter buffer → altijd nieuwste frame
+3. Multi-path bonding → LTE + 5G + WiFi gecombineerd
+
+Benchmark (Adamo blog, zelfde camera door alle drie simultaan):
+
+| Packet loss | Adamo | LiveKit | Transitive |
+|---|---|---|---|
+| 0% | ~83ms | ~100ms | ~100ms |
+| 10% | 133ms | 183ms | 617ms |
+| 15% | ~180ms | ~220ms | stream dropped |
+
+### LiveKit Portal
+
+Open source Rust/Python laag bovenop WebRTC SFU.
+Elke frame + elk control-pakket krijgt monotone klok-timestamp,
+gebundeld in één "observation" per tick (camera + joint state + timestamp).
+SCTP data channels: per stream instelbaar als reliable of unreliable.
+
+### Transitive (open source)
+
+`transAct` is een fork-and-customize fleet dashboard (React + ShadCn + Tailwind).
+WebRTC als transport → kwetsbaar onder packet loss. Waarde: fleet management UI patronen.
+
+### Ottopia
+
+Proprietary FEC + multi-path bonding. AI-gebaseerde super-resolutie (−20% bandbreedte).
+Focus militair + AV. Enterprise pricing, niet relevant voor robotica prototype-fase.
+
+### Avear Robotics
+
+Opgericht 2024, San Francisco. Eerste deal maart 2026.
+Claimt 10ms latency — waarschijnlijk lokaal (USB camera, geen netwerk).
+Ondersteunt 6× HD + haptic feedback. AI-integratie gepland Q4 2026.
+
+### AY-Robots
+
+€50/robot/mnd, WebRTC. Pay-per-hour ook beschikbaar.
+Focus: AI training data collectie. Ondersteunt SO-100, Franka, ALOHA, etc.
+SOC 2 compliant. Niet geschikt als latency-referentie.
